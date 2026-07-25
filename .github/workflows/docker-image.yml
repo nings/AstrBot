@@ -55,12 +55,14 @@ jobs:
           cd dashboard
           npm install
           npm run build
+          npm run build:webui
           mkdir -p dist/assets
           echo "$dashboard_version" > dist/assets/version
           cd ..
           mkdir -p astrbot/dashboard
-          rm -rf astrbot/dashboard/dist
+          rm -rf astrbot/dashboard/dist astrbot/dashboard/dist-webui
           cp -r dashboard/dist astrbot/dashboard/dist
+          cp -r dashboard/dist-webui astrbot/dashboard/dist-webui
 
       - name: Determine test image tags
         id: test-meta
@@ -163,12 +165,14 @@ jobs:
           cd dashboard
           npm install
           npm run build
+          npm run build:webui
           mkdir -p dist/assets
           echo "${{ steps.release-meta.outputs.version }}" > dist/assets/version
           cd ..
           mkdir -p astrbot/dashboard
-          rm -rf astrbot/dashboard/dist
+          rm -rf astrbot/dashboard/dist astrbot/dashboard/dist-webui
           cp -r dashboard/dist astrbot/dashboard/dist
+          cp -r dashboard/dist-webui astrbot/dashboard/dist-webui
 
       - name: Set QEMU
         uses: docker/setup-qemu-action@v4.2.0

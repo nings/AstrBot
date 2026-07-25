@@ -121,11 +121,12 @@ exclude = ["dashboard", "node_modules", "dist", "data", "tests"]
 [tool.hatch.metadata]
 allow-direct-references = true
 
-# Include bundled dashboard dist even though it is not tracked by VCS.
+# Include bundled dashboard dists even though they are not tracked by VCS.
+# `dist` is the operator dashboard; `dist-webui` is the end-user chat SPA.
 [tool.hatch.build]
-artifacts = ["astrbot/dashboard/dist/**"]
+artifacts = ["astrbot/dashboard/dist/**", "astrbot/dashboard/dist-webui/**"]
 
-# Custom build hook: builds the Vue dashboard and copies dist into the package.
+# Custom build hook: builds both Vue SPAs and copies their dists into the package.
 [tool.hatch.build.hooks.custom]
 path = "scripts/hatch_build.py"
 
