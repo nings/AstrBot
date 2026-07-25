@@ -97,15 +97,11 @@
                             :is-streaming="isMessageStreaming(msgIndex)"
                           />
 
-                          <div
+                          <PortalAttachment
                             v-else-if="['image', 'record', 'video', 'file'].includes(part.type)"
-                            class="attachment-chip"
-                            :style="{ '--attachment-color': attachmentPresentation(part).color }"
-                          >
-                            <v-icon :icon="attachmentPresentation(part).icon" size="18" />
-                            <span class="attachment-chip-label">{{ attachmentName(part) }}</span>
-                            <span class="attachment-chip-note">附件预览暂不支持</span>
-                          </div>
+                            :part="part"
+                            :is-dark="isDark"
+                          />
 
                           <div v-else-if="part.type === 'tool_call'" class="tool-call-block">
                             <template v-for="tool in part.tool_calls || []" :key="tool.id || tool.name">
@@ -230,9 +226,6 @@
 //     - `@/components/chat/message_list_comps/{ReasoningBlock,ToolCallCard,
 //       ToolCallItem,IPythonToolBlock,ActionRef,RefsSidebar}.vue` (reasoning
 //       timeline, tool-call cards, web-search reference chips/sidebar).
-//     - `@/components/chat/attachmentPresentation` (icon/label metadata for
-//       the degraded attachment chip -- see below for why there is no
-//       download/preview).
 //     - `@/composables/useMessages`'s *pure* exports: `messageBlocks`,
 //       `normalizeMessageParts`, `extractReasoningText`, `appendPlain`,
 //       `appendReasoningPart`, `upsertToolCall`, `finishToolCall`,
@@ -244,6 +237,13 @@
 //     - `@/i18n/composables` (`useModuleI18n("features/chat")`, the same
 //       translation namespace the reused components above already read
 //       from) and `@/utils/clipboard` (`copyToClipboard`).
+//     - `./PortalAttachment.vue` (this module's own owned attachment
+//       renderer, Phase 2) for every `image`/`record`/`video`/`file`
+//       message part -- both on outgoing user messages (attached
+//       optimistically at send time, see `sendMessage`) and incoming
+//       assistant messages (wired from the `image`/`record`/`file`/
+//       `video` + `attachment_saved` SSE frame pair below, see
+//       `applyStreamFrame`).
 //
 //   DELIBERATELY NOT REUSED, WITH REASONS:
 //     - `useMessages()` (the composable *factory*, as opposed to its pure
@@ -274,14 +274,17 @@
 //       fetch helper is used instead (mirrors `PortalSessionList.vue`; no
 //       shared portal API-client module exists in this phase's file
 //       ownership -- see this component's `notes_for_integrator`).
-//     - Attachment content (`image`/`record`/`video`/`file` parts emitted
-//       mid-stream by tool output) is rendered as an inert metadata chip,
-//       never as a fetchable `<img>`/`<audio>`/`<video>` against
-//       `@/api/v1`'s `fileApi`: that hits the *admin* `/api/v1/files/*`
-//       endpoints, which the architecture plan's verified ground truth
-//       explicitly forbids exposing to the portal frontend, and Phase 1
-//       ships no portal-scoped attachment-ownership/content endpoint at all
-//       (core_facade's own documented gaps confirm this).
+//     - Attachment content (`image`/`record`/`video`/`file` parts, whether
+//       emitted mid-stream by tool output or attached to an outgoing user
+//       message) is rendered as a real, fetchable `<img>`/`<audio>`/
+//       `<video>`/download-chip by `./PortalAttachment.vue` -- but never
+//       against `@/api/v1`'s `fileApi`: that hits the *admin*
+//       `/api/v1/files/*` endpoints, which the architecture plan's
+//       verified ground truth explicitly forbids exposing to the portal
+//       frontend (no ownership check at all on that route). Every URL
+//       `PortalAttachment.vue` builds points at this phase's own
+//       ownership-checked `GET /api/v1/portal/files/{attachment_id}`
+//       instead (`astrbot/portal/api/file_routes.py`).
 import {
   computed,
   defineComponent,
@@ -308,10 +311,6 @@ import IPythonToolBlock from "@/components/chat/message_list_comps/IPythonToolBl
 import ActionRef from "@/components/chat/message_list_comps/ActionRef.vue";
 import RefsSidebar from "@/components/chat/message_list_comps/RefsSidebar.vue";
 import {
-  attachmentName,
-  attachmentPresentation,
-} from "@/components/chat/attachmentPresentation";
-import {
   appendPlain,
   appendReasoningPart,
   buildChatRequestFlags,
@@ -327,10 +326,12 @@ import {
   type ChatContent,
   type ChatRecord,
   type MessageDisplayBlock,
+  type MessagePart,
 } from "@/composables/useMessages";
 import { copyToClipboard } from "@/utils/clipboard";
 import PortalSessionList from "@/components/portal/PortalSessionList.vue";
 import PortalComposer from "@/components/portal/PortalComposer.vue";
+import PortalAttachment from "@/components/portal/PortalAttachment.vue";
 
 registerPortalChatMarkdownComponents();
 
@@ -591,7 +592,36 @@ function applyStreamFrame(
     const rawFilename = String(data).replace(/^\[(IMAGE|RECORD|FILE|VIDEO)\]/, "");
     const separatorIndex = rawFilename.indexOf("|");
     const filename = separatorIndex >= 0 ? rawFilename.slice(separatorIndex + 1) : rawFilename;
+    // No `attachment_id` yet -- this raw frame only carries the tool's
+    // on-disk filename, which is not a portal attachment_id and cannot be
+    // used to build a fetchable URL. `PortalAttachment.vue` renders this
+    // as a "processing" placeholder until the `attachment_saved` frame
+    // below (published immediately after core finishes writing the file
+    // and registering it, see `chat_service.py:965-998`) supplies the
+    // real id.
     botRecord.content.message.push({ type: msgType, filename });
+    return false;
+  }
+
+  if (msgType === "attachment_saved") {
+    // Backfills the `attachment_id` onto the most recently pushed media
+    // part of the same type that doesn't have one yet. Core publishes
+    // this frame immediately after the raw media frame it corresponds to
+    // (one core-attachment-creation call per loop iteration, synchronously
+    // before the next tool message is even processed -- see
+    // `chat_service.py:965-1006`), so at the moment this frame arrives
+    // there is at most one outstanding part per type, and searching from
+    // the end for the nearest unmatched part of `data.type` reliably picks
+    // it out even if several media parts of the same type appear across
+    // one turn.
+    const parts = botRecord.content.message;
+    for (let i = parts.length - 1; i >= 0; i -= 1) {
+      const part = parts[i];
+      if (part.type === data?.type && !part.attachment_id) {
+        part.attachment_id = data?.id;
+        break;
+      }
+    }
     return false;
   }
 
@@ -991,14 +1021,70 @@ async function resumeActiveRun(sessionId: string, run: any) {
 // ---------------------------------------------------------------------------
 // Send / stop / regenerate
 // ---------------------------------------------------------------------------
-async function sendMessage(text: string) {
+
+/**
+ * Structural (not imported) mirror of `usePortalMediaHandling.ts`'s
+ * `PortalMessagePart` -- the exact shape `PortalComposer.vue`'s `send`
+ * event now carries as its multimodal list form (its own `toMessageParts`
+ * return type). Declared locally rather than imported so this file's
+ * accepted parameter type doesn't hard-depend on a sibling composable's
+ * type export surface; it is kept in lock-step with that shape by hand
+ * (`type` + optional `text`/`attachment_id`/`filename`, nothing else) --
+ * `MessagePart` from `useMessages.ts` cannot be used directly for the
+ * *parameter* type here despite being structurally similar, since its
+ * `[key: string]: unknown` index signature makes plain object-literal
+ * shapes like `PortalMessagePart` (which has no index signature of its
+ * own) fail assignability as a function parameter.
+ */
+interface IncomingMessagePart {
+  type: string;
+  text?: string;
+  attachment_id?: string;
+  filename?: string;
+}
+
+/**
+ * `sendMessage`'s single argument is whatever the composer already
+ * resolved the turn's wire payload down to -- a bare trimmed string when
+ * there are no successfully uploaded attachments (byte-identical to this
+ * phase's pre-attachment wire shape), or the multimodal list form
+ * otherwise: one `{type, attachment_id, filename}` part per uploaded
+ * attachment (already real, already ownership-registered, since the
+ * composer only ever hands back attachments whose upload has completed)
+ * followed by an optional trailing `{type: "plain", text}` part.
+ *
+ * Displaying it is then just "use these parts as the optimistic user
+ * message's content" -- no separate attachment-list parameter, no
+ * reassembly: whatever the server will receive is exactly what
+ * `PortalAttachment.vue`/the plain-text renderer render immediately,
+ * satisfying "display attachments on outgoing user messages
+ * optimistically, right after send" without a second source of truth.
+ */
+async function sendMessage(message: string | IncomingMessagePart[]) {
   const sessionId = activeSessionId.value;
   if (!sessionId || isGenerating.value) return;
+
+  const messageIsList = Array.isArray(message);
+  const trimmedText = messageIsList ? "" : message.trim();
+  if (messageIsList ? message.length === 0 : !trimmedText) return;
+
+  // Rebuilt as fresh `MessagePart` object literals (rather than assigning
+  // `message` in place) precisely to cross the index-signature boundary
+  // noted on `IncomingMessagePart` above -- each entry keeps only the keys
+  // `MessagePart`/the server actually understand.
+  const displayParts: MessagePart[] = messageIsList
+    ? message.map((part) => ({
+        type: part.type,
+        text: part.text,
+        attachment_id: part.attachment_id,
+        filename: part.filename,
+      }))
+    : [{ type: "plain", text: trimmedText }];
 
   const userRecord = reactive<ChatRecord>({
     id: `local-user-${Date.now()}`,
     created_at: new Date().toISOString(),
-    content: { type: "user", message: [{ type: "plain", text }] },
+    content: { type: "user", message: displayParts },
   });
   const botRecord = reactive<ChatRecord>({
     id: `local-bot-${Date.now()}`,
@@ -1011,12 +1097,15 @@ async function sendMessage(text: string) {
   isGenerating.value = true;
   scrollToBottomSoon();
 
+  // Forwarded to the server exactly as received -- matches
+  // `SendMessageRequest.message: str | list[MessagePart]` in
+  // `chat_routes.py` verbatim, list form or bare string alike.
   const abort = new AbortController();
   currentAbort = abort;
   try {
     const response = await portalFetch(`/chat/sessions/${encodeURIComponent(sessionId)}/messages`, {
       method: "POST",
-      body: JSON.stringify({ message: text, flags: buildChatRequestFlags(true) }),
+      body: JSON.stringify({ message, flags: buildChatRequestFlags(true) }),
       signal: abort.signal,
     });
     if (!response.ok || !response.body) {
@@ -1244,28 +1333,6 @@ async function regenerateLast() {
   display: flex;
   align-items: center;
   gap: 8px;
-  color: var(--chat-muted);
-}
-
-.attachment-chip {
-  --attachment-color: #607d8b;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 8px;
-  padding: 7px 10px;
-  border-radius: 8px;
-  background: rgba(var(--v-theme-on-surface), 0.055);
-  color: var(--attachment-color);
-  font-size: 12.5px;
-}
-
-.attachment-chip-label {
-  color: rgb(var(--v-theme-on-surface));
-  font-weight: 500;
-}
-
-.attachment-chip-note {
   color: var(--chat-muted);
 }
 
