@@ -68,12 +68,12 @@ jobs:
         run: |
           pnpm install --frozen-lockfile
           pnpm run build
-          pnpm run build:webui
+          pnpm run build:portal
           echo "${{ steps.tag.outputs.tag }}" > dist/assets/version
-          # `dist` is the operator dashboard, `dist-webui` the end-user chat SPA.
+          # `dist` is the operator dashboard, `dist-portal` the end-user chat SPA.
           # Both are shipped in the same archive; the server resolves each from
           # its own directory name under the AstrBot data dir.
-          zip -r "AstrBot-${{ steps.tag.outputs.tag }}-dashboard.zip" dist dist-webui
+          zip -r "AstrBot-${{ steps.tag.outputs.tag }}-dashboard.zip" dist dist-portal
 
       - name: Build core package
         shell: bash

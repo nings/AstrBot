@@ -5,10 +5,10 @@
   "author": "CodedThemes",
   "scripts": {
     "dev": "node scripts/subset-mdi-font.mjs && vite --host",
-    "dev:webui": "node scripts/subset-mdi-font.mjs && vite --config vite.webui.config.ts --host",
+    "dev:portal": "node scripts/subset-mdi-font.mjs && vite --config vite.portal.config.ts --host",
     "build:t2i-shiki-runtime": "node scripts/build-t2i-shiki-runtime.mjs",
     "build": "node scripts/subset-mdi-font.mjs && vue-tsc --noEmit && vite build",
-    "build:webui": "node scripts/subset-mdi-font.mjs && vue-tsc --noEmit && vite build --config vite.webui.config.ts",
+    "build:portal": "node scripts/subset-mdi-font.mjs && vue-tsc --noEmit && vite build --config vite.portal.config.ts",
     "build-stage": "node scripts/subset-mdi-font.mjs && vue-tsc --noEmit && vite build --base=/vue/free/stage/",
     "build-prod": "node scripts/subset-mdi-font.mjs && vue-tsc --noEmit && vite build --base=/vue/free/",
     "preview": "vite preview --port 5050",
@@ -16,7 +16,7 @@
     "generate:docs:openapi": "uv run python ../docs/scripts/update_openapi_json.py",
     "typecheck": "vue-tsc --noEmit",
     "lint": "eslint . --ext .vue,.js,.jsx,.cjs,.mjs,.ts,.tsx,.cts,.mts --fix --ignore-path .gitignore",
-    "lint:webui": "eslint src/components/webui src/webui-main.ts src/api/webui.ts src/stores/webuiAuth.ts src/router/EndUserRoutes.ts --ext .vue,.ts --max-warnings 0"
+    "lint:portal": "eslint src/components/portal src/portal-main.ts src/api/portal.ts src/stores/portalAuth.ts src/router/EndUserRoutes.ts --ext .vue,.ts --max-warnings 0"
   },
   "dependencies": {
     "@guolao/vue-monaco-editor": "^1.5.4",

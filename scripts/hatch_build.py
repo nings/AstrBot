@@ -12,10 +12,10 @@ When enabled, this hook:
 2. Copies the resulting `dashboard/dist/` tree into
    `astrbot/dashboard/dist/` so the static assets are shipped
    inside the Python wheel.
-3. Does the same for the end-user chat SPA: `npm run build:webui`
-   produces `dashboard/dist-webui/`, which is copied into
-   `astrbot/dashboard/dist-webui/` (the path
-   `astrbot.webui.api.static_router.get_bundled_webui_dist_path()` resolves).
+3. Does the same for the end-user chat SPA: `npm run build:portal`
+   produces `dashboard/dist-portal/`, which is copied into
+   `astrbot/dashboard/dist-portal/` (the path
+   `astrbot.portal.api.static_router.get_bundled_portal_dist_path()` resolves).
 """
 
 import os
@@ -56,11 +56,11 @@ class CustomBuildHook(BuildHookInterface):
             )
 
         # Both SPAs are built from the same source tree with separate Vite
-        # configs, so each needs its own build + copy pass. `dist-webui` is the
+        # configs, so each needs its own build + copy pass. `dist-portal` is the
         # end-user chat SPA; `dist` is the operator dashboard.
         self._build_and_copy(root, dashboard_src, "build", "dist", "dashboard")
         self._build_and_copy(
-            root, dashboard_src, "build:webui", "dist-webui", "end-user webui"
+            root, dashboard_src, "build:portal", "dist-portal", "end-user portal"
         )
 
     def _build_and_copy(

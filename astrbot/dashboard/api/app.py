@@ -54,9 +54,9 @@ from astrbot.dashboard.services.update_service import (
     call_get_dashboard_version,
     call_pip_install,
 )
-from astrbot.webui.api.static_router import router as webui_static_router
-from astrbot.webui.db import engine as webui_db_engine
-from astrbot.webui.services import core_facade as webui_core_facade
+from astrbot.portal.api.static_router import router as portal_static_router
+from astrbot.portal.db import engine as portal_db_engine
+from astrbot.portal.services import core_facade as portal_core_facade
 
 from .api_keys import legacy_router as legacy_api_keys_router
 from .auth import legacy_router as legacy_auth_router
@@ -89,8 +89,8 @@ from .updates import legacy_router as legacy_updates_router
 CLEAR_SITE_DATA_HEADERS = {"Clear-Site-Data": '"cache"'}
 
 
-async def init_webui_module_state(app: FastAPI) -> None:
-    """Wire up the astrbot/webui/** module's own runtime state.
+async def init_portal_module_state(app: FastAPI) -> None:
+    """Wire up the astrbot/portal/** module's own runtime state.
 
     Registered as a FastAPI startup hook below (needs to run once the event
     loop is actually up, since both steps need async I/O -- aiosqlite /
@@ -100,29 +100,29 @@ async def init_webui_module_state(app: FastAPI) -> None:
     ``create_dashboard_asgi_app``) so it can also be awaited directly from a
     test without having to drive the ASGI lifespan protocol.
 
-    Without this, every request into ``/api/v1/webui/*`` fails:
+    Without this, every request into ``/api/v1/portal/*`` fails:
 
-    1. ``webui_db_engine.init_webui_db()`` creates the module's independent
-       SQLite schema (``webui_users``/``webui_sessions``/etc). Nothing else
+    1. ``portal_db_engine.init_portal_db()`` creates the module's independent
+       SQLite schema (``portal_users``/``portal_sessions``/etc). Nothing else
        in the codebase ever calls it, so without this the very first
-       ``POST /api/v1/webui/auth/register`` raises
-       ``sqlite3.OperationalError: no such table: webui_users``.
-    2. ``app.state.webui_jwt_secret`` is read by
-       ``astrbot.webui.auth.dependencies.get_current_user`` on every
-       protected webui route; if it is never set there, every such request
+       ``POST /api/v1/portal/auth/register`` raises
+       ``sqlite3.OperationalError: no such table: portal_users``.
+    2. ``app.state.portal_jwt_secret`` is read by
+       ``astrbot.portal.auth.dependencies.get_current_user`` on every
+       protected portal route; if it is never set there, every such request
        401s unconditionally regardless of how valid the caller's cookie is.
     """
-    await webui_db_engine.init_webui_db()
-    app.state.webui_jwt_secret = await webui_core_facade.get_jwt_secret()
+    await portal_db_engine.init_portal_db()
+    app.state.portal_jwt_secret = await portal_core_facade.get_jwt_secret()
 
 
 @asynccontextmanager
 async def _dashboard_lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """FastAPI ``lifespan`` handler: currently only wires up the webui
-    module's runtime state (see ``init_webui_module_state``) on startup.
+    """FastAPI ``lifespan`` handler: currently only wires up the portal
+    module's runtime state (see ``init_portal_module_state``) on startup.
     Nothing needs to run on shutdown yet.
     """
-    await init_webui_module_state(app)
+    await init_portal_module_state(app)
     yield
 
 
@@ -256,8 +256,8 @@ def create_dashboard_asgi_app(
     app.include_router(build_api_router())
     # Must be included BEFORE static_files_router: that router's last route
     # is a greedy catch-all (GET /{static_path:path}) serving the operator
-    # dashboard's SPA, which would otherwise swallow every /webui/* request
+    # dashboard's SPA, which would otherwise swallow every /portal/* request
     # before this router ever got a chance to serve the end-user SPA.
-    app.include_router(webui_static_router)
+    app.include_router(portal_static_router)
     app.include_router(static_files_router)
     return app
