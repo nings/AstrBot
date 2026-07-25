@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -64,6 +65,62 @@ use this directly only for one-off scripts/background jobs.
 _initialized = False
 
 
+def _add_missing_columns(connection) -> None:
+    """Add columns that exist in the models but not yet in an existing table.
+
+    ``metadata.create_all`` creates missing *tables* but never alters existing
+    ones, so a database file created by an earlier phase of this module keeps
+    its old shape and any column added since then is simply absent -- the next
+    query referencing it fails with "no such column". This module has no
+    migration framework (the knowledge-base module it is modelled on has none
+    either), so schema growth is reconciled here.
+
+    Deliberately limited to the one operation SQLite can do safely and
+    idempotently on a populated table: ``ALTER TABLE ... ADD COLUMN`` for a
+    column that is nullable or carries a default. Anything else -- a dropped
+    or renamed column, a type change, a new NOT NULL column with no default --
+    is logged as a warning and left alone rather than silently attempted,
+    because getting it wrong means data loss. Those need a real migration.
+    """
+    inspector = sa_inspect(connection)
+    existing_tables = set(inspector.get_table_names())
+
+    for table in PortalBaseModel.metadata.sorted_tables:
+        if table.name not in existing_tables:
+            continue  # just created by create_all, already current
+
+        present = {c["name"] for c in inspector.get_columns(table.name)}
+        for column in table.columns:
+            if column.name in present:
+                continue
+
+            nullable = column.nullable
+            has_default = column.default is not None or column.server_default is not None
+            if not nullable and not has_default:
+                logger.warning(
+                    f"[portal] column {table.name}.{column.name} is missing from the "
+                    "existing database and is NOT NULL without a default, so it "
+                    "cannot be added automatically. A manual migration is required."
+                )
+                continue
+
+            ddl_type = column.type.compile(dialect=connection.dialect)
+            clause = f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {ddl_type}'
+            if not nullable:
+                default = column.default.arg if column.default is not None else None
+                literal = (
+                    column.server_default.arg
+                    if column.server_default is not None
+                    else repr(default) if isinstance(default, str) else default
+                )
+                clause += f" NOT NULL DEFAULT {literal}"
+            elif has_default and column.server_default is not None:
+                clause += f" DEFAULT {column.server_default.arg}"
+
+            connection.execute(text(clause))
+            logger.info(f"[portal] schema reconciled: added {table.name}.{column.name}")
+
+
 async def init_portal_db() -> None:
     """Create all portal tables and apply SQLite pragmas.
 
@@ -79,6 +136,7 @@ async def init_portal_db() -> None:
 
     async with portal_engine.begin() as conn:
         await conn.run_sync(PortalBaseModel.metadata.create_all)
+        await conn.run_sync(_add_missing_columns)
         await conn.execute(text("PRAGMA journal_mode=WAL"))
         await conn.execute(text("PRAGMA busy_timeout=30000"))
         await conn.execute(text("PRAGMA synchronous=NORMAL"))
