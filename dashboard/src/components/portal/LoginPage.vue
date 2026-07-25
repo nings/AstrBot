@@ -22,11 +22,27 @@
  * Identity is never read from anything the client sends except the
  * credentials the user typed -- the server derives `user_id` solely from
  * its own verified session/JWT.
+ *
+ * Phase 5b adds SSO login buttons, driven entirely by
+ * `GET /api/v1/portal/auth/sso/providers` (see `astrbot/portal/api/
+ * auth_routes.py`'s `sso_providers`, backed by `astrbot/portal/config.py`'s
+ * `get_sso_provider_availability`): that endpoint returns `{provider: bool}`
+ * for every provider this build knows about, already accounting for both
+ * `PortalSettings.sso_enabled`/`sso_enabled_providers` AND per-provider
+ * credential presence, so a provider that is merely enabled-but-half-
+ * configured still renders `false` here -- this page never renders a
+ * button for anything but a `true` entry, precisely so a disabled/
+ * unconfigured provider never renders a button that would fail the moment
+ * it is clicked. Clicking a rendered button is a real top-level navigation
+ * (`window.location.assign`) to that provider's public, unauthenticated
+ * `GET /sso/{provider}/start` route -- never an XHR -- since that route's
+ * whole job is to 302 the browser to the identity provider itself.
  */
-import { computed, onBeforeUnmount, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { useModuleI18n } from '@/i18n/composables';
 import { usePortalAuthStore } from '@/stores/portalAuth';
+import portalApi from '@/api/portal';
 import LanguageSwitcher from '@/components/shared/LanguageSwitcher.vue';
 
 const { tm: t } = useModuleI18n('features/auth');
@@ -150,6 +166,62 @@ async function onSubmit() {
     loading.value = false;
   }
 }
+
+// --- SSO (Phase 5b) -------------------------------------------------------
+
+const SSO_PROVIDER_ORDER = ['oidc', 'wecom', 'feishu'] as const;
+const SSO_PROVIDER_ICONS: Record<(typeof SSO_PROVIDER_ORDER)[number], string> = {
+  oidc: 'mdi-shield-key-outline',
+  wecom: 'mdi-wechat',
+  feishu: 'mdi-message-processing-outline',
+};
+
+const ssoProviders = ref<Partial<Record<string, boolean>>>({});
+// `registrationOpen` mirrors `PortalSettings.self_registration_open`, but no
+// endpoint currently exposes that flag publicly (verified: neither
+// `GET /auth/sso/providers` nor any other unauthenticated route in
+// `auth_routes.py` returns it -- see this task's `gaps`). Defaulting to
+// `true` (the register link renders exactly as it always has) is the only
+// choice that cannot turn a working link into a dead one on a deployment
+// this page has no way to ask; the read below is forward-compatible should
+// that endpoint gain the field later without requiring another change here.
+const registrationOpen = ref(true);
+
+const enabledSsoProviders = computed(() =>
+  SSO_PROVIDER_ORDER.filter((provider) => ssoProviders.value[provider] === true),
+);
+const hasSsoProviders = computed(() => enabledSsoProviders.value.length > 0);
+
+onMounted(async () => {
+  try {
+    const res = await portalApi.get('/auth/sso/providers');
+    ssoProviders.value = (res.data?.providers as Partial<Record<string, boolean>>) ?? {};
+    if (typeof res.data?.self_registration_open === 'boolean') {
+      registrationOpen.value = res.data.self_registration_open;
+    }
+  } catch {
+    // SSO buttons are a progressive enhancement on top of an already fully
+    // functional email/password form -- a failed fetch here must never
+    // block or error out the rest of the login page, it just means no SSO
+    // buttons render this load.
+    ssoProviders.value = {};
+  }
+});
+
+function startSsoLogin(provider: string) {
+  const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : null;
+  // `/auth/sso/{provider}/start`'s `next` param is validated server-side
+  // against a `/portal`-prefixed allowlist (see `auth_routes.py`'s
+  // `_validate_redirect_target`) -- this router's own route paths never
+  // include that prefix (EndUserRoutes.ts's hash-history base already is
+  // `/portal/`), so it must be added back on here.
+  const target = redirect && redirect.startsWith('/') ? redirect : '/chat';
+  const next = `/portal${target}`;
+  const url = `/api/v1/portal/auth/sso/${encodeURIComponent(provider)}/start?next=${encodeURIComponent(next)}`;
+  // A real top-level navigation, not portalApi/XHR -- this route's whole
+  // purpose is to 302 the browser to the identity provider.
+  window.location.assign(url);
+}
 </script>
 
 <template>
@@ -243,11 +315,37 @@ async function onSubmit() {
           </v-btn>
         </form>
 
-        <div class="portal-auth-switch">
+        <template v-if="hasSsoProviders">
+          <div class="portal-auth-divider">
+            <span>{{ t('portal.login.sso.divider') }}</span>
+          </div>
+
+          <div class="portal-sso-buttons">
+            <v-btn
+              v-for="provider in enabledSsoProviders"
+              :key="provider"
+              block
+              size="large"
+              variant="outlined"
+              class="portal-sso-btn"
+              :prepend-icon="SSO_PROVIDER_ICONS[provider]"
+              :disabled="loading || isLocked"
+              @click="startSsoLogin(provider)"
+            >
+              {{ t(`portal.login.sso.continueWith.${provider}`) }}
+            </v-btn>
+          </div>
+        </template>
+
+        <div v-if="registrationOpen" class="portal-auth-switch">
           <span>{{ t('portal.login.noAccount') }}</span>
           <router-link :to="{ name: 'portal-register' }" class="portal-auth-switch-link">
             {{ t('portal.login.registerLink') }}
           </router-link>
+        </div>
+        <div v-else class="portal-auth-switch portal-auth-switch-closed">
+          <v-icon size="14" class="mr-1">mdi-information-outline</v-icon>
+          <span>{{ t('portal.login.registrationClosedNotice') }}</span>
         </div>
       </v-card>
 
@@ -350,13 +448,50 @@ async function onSubmit() {
   font-variant-numeric: tabular-nums;
 }
 
+.portal-auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 22px 0 16px;
+  font-size: 0.75rem;
+  color: rgba(var(--v-theme-on-surface), 0.45);
+
+  &::before,
+  &::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: rgba(var(--v-theme-on-surface), 0.12);
+  }
+}
+
+.portal-sso-buttons {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.portal-sso-btn {
+  height: 46px;
+  border-radius: 8px !important;
+  text-transform: none;
+  letter-spacing: normal;
+  font-weight: 500;
+}
+
 .portal-auth-switch {
   display: flex;
   justify-content: center;
+  align-items: center;
   gap: 6px;
   margin-top: 24px;
   font-size: 0.875rem;
   color: rgba(var(--v-theme-on-surface), 0.65);
+}
+
+.portal-auth-switch-closed {
+  text-align: center;
+  color: rgba(var(--v-theme-on-surface), 0.5);
 }
 
 .portal-auth-switch-link {

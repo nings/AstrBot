@@ -100,6 +100,11 @@ const MainRoutes = {
       component: () => import('@/components/admin/PortalAgentBundlesAdminPage.vue')
     },
     {
+      name: 'PortalUsersAdmin',
+      path: '/portal-users',
+      component: () => import('@/components/admin/PortalUsersAdminPage.vue')
+    },
+    {
       name: 'CronJobs',
       path: '/cron',
       component: () => import('@/views/CronJobPage.vue')

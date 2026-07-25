@@ -1,4 +1,4 @@
-/* Auto-generated MDI subset – 280 icons */
+/* Auto-generated MDI subset – 292 icons */
 /* Do not edit manually. Run: pnpm run subset-icons */
 
 @font-face {
@@ -40,8 +40,20 @@
   content: "\F0899";
 }
 
+.mdi-account-off-outline::before {
+  content: "\F0BE7";
+}
+
 .mdi-account-outline::before {
   content: "\F0013";
+}
+
+.mdi-account-plus-outline::before {
+  content: "\F0801";
+}
+
+.mdi-account-switch-outline::before {
+  content: "\F04CB";
 }
 
 .mdi-account-voice::before {
@@ -58,6 +70,10 @@
 
 .mdi-alert-circle-outline::before {
   content: "\F05D6";
+}
+
+.mdi-alert-octagon-outline::before {
+  content: "\F0CE6";
 }
 
 .mdi-alert-outline::before {
@@ -162,6 +178,10 @@
 
 .mdi-calendar-plus::before {
   content: "\F00F3";
+}
+
+.mdi-cash-sync::before {
+  content: "\F1A92";
 }
 
 .mdi-chat::before {
@@ -382,6 +402,10 @@
 
 .mdi-download-outline::before {
   content: "\F0B8F";
+}
+
+.mdi-email-off-outline::before {
+  content: "\F13E4";
 }
 
 .mdi-email-outline::before {
@@ -660,6 +684,10 @@
   content: "\F0337";
 }
 
+.mdi-link-lock::before {
+  content: "\F10BA";
+}
+
 .mdi-link-off::before {
   content: "\F0338";
 }
@@ -718,6 +746,10 @@
 
 .mdi-message-outline::before {
   content: "\F0365";
+}
+
+.mdi-message-processing-outline::before {
+  content: "\F1170";
 }
 
 .mdi-message-text::before {
@@ -904,6 +936,10 @@
   content: "\F06A9";
 }
 
+.mdi-robot-confused-outline::before {
+  content: "\F16A0";
+}
+
 .mdi-robot-off::before {
   content: "\F16A7";
 }
@@ -946,6 +982,10 @@
 
 .mdi-shield-key::before {
   content: "\F0BC4";
+}
+
+.mdi-shield-key-outline::before {
+  content: "\F0BC5";
 }
 
 .mdi-shield-lock-outline::before {
@@ -1010,6 +1050,10 @@
 
 .mdi-svg::before {
   content: "\F0721";
+}
+
+.mdi-swap-horizontal::before {
+  content: "\F04E1";
 }
 
 .mdi-sync::before {
@@ -1122,6 +1166,10 @@
 
 .mdi-webhook::before {
   content: "\F062F";
+}
+
+.mdi-wechat::before {
+  content: "\F0611";
 }
 
 .mdi-white-balance-sunny::before {
