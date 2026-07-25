@@ -159,6 +159,7 @@ export default defineConfig({
             base: "/use",
             items: [
               { text: "WebUI", link: "/webui" },
+              { text: "Portal 多用户前端", link: "/portal" },
               { text: "CLI 指令", link: "/cli" },
               { text: "插件", link: "/plugin" },
               { text: "内置指令", link: "/command" },
@@ -415,6 +416,7 @@ export default defineConfig({
             collapsed: true,
             items: [
               { text: "WebUI", link: "/webui" },
+              { text: "Portal (multi-user frontend)", link: "/portal" },
               { text: "CLI Commands", link: "/cli" },
               { text: "Plugins", link: "/plugin" },
               { text: "Built-in Commands", link: "/command" },
