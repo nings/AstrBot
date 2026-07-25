@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any
+from typing import Any, Protocol
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import col, select
@@ -21,6 +21,98 @@ AVAILABLE_SESSION_RULE_KEYS = [
     f"provider_perf_{ProviderType.SPEECH_TO_TEXT.value}",
     f"provider_perf_{ProviderType.TEXT_TO_SPEECH.value}",
 ]
+
+
+class SessionRuleGuard(Protocol):
+    """A feature module's claim over one session-rule key for certain umos.
+
+    Some rule keys carry security meaning that this route cannot validate.
+    ``kb_config`` is the motivating case: for a session belonging to the
+    end-user portal it is the only thing standing between an end user and the
+    operator's *global* knowledge-base corpora, because
+    ``retrieve_knowledge_base`` treats a *missing* ``kb_config`` as "fall back
+    to the operator's global ``kb_names``" rather than as "no knowledge base"
+    (``astrbot/core/tools/knowledge_base_tools.py``). This route is gated by
+    ``require_data_scope``, a narrower tier than the module that owns the key
+    requires for its own writes, and it knows nothing about that module's
+    whitelist, count or top_k rules -- so writing the value verbatim here
+    bypasses them, and removing the key re-opens the fallback.
+
+    Rather than teach this service about any particular module, a module
+    registers a guard and this service asks. Core therefore imports nothing
+    from feature modules, and a deployment without the module registers no
+    guard and behaves exactly as before.
+    """
+
+    async def owns(self, umo: str, rule_key: str) -> bool:
+        """Whether this guard claims ``rule_key`` for ``umo``."""
+        ...
+
+    async def reset(self, umo: str, rule_key: str) -> None:
+        """Write the guard's safe value for ``rule_key``, used instead of
+        removing the key, since absence may not mean what a caller expects."""
+        ...
+
+    @property
+    def refusal_message(self) -> str:
+        """Explanation returned when a write to a guarded key is refused."""
+        ...
+
+
+_SESSION_RULE_GUARDS: list[SessionRuleGuard] = []
+
+
+def register_session_rule_guard(guard: SessionRuleGuard) -> None:
+    """Register a module's claim over one or more session-rule keys.
+
+    Called by the owning module at startup. Idempotent per guard instance so a
+    repeated lifespan (tests, reloads) does not stack duplicates.
+    """
+    if guard not in _SESSION_RULE_GUARDS:
+        _SESSION_RULE_GUARDS.append(guard)
+
+
+def clear_session_rule_guards() -> None:
+    """Drop all registered guards. For tests and process teardown."""
+    _SESSION_RULE_GUARDS.clear()
+
+
+async def _restore_guarded_keys(umo: str) -> None:
+    """Re-write every guarded key's safe value after a blanket clear.
+
+    ``sp.clear_async`` wipes every preference for a umo, including keys a
+    module guards. Since absence can carry the opposite meaning of the module's
+    safe value, each guard is given the chance to restore it.
+    """
+    for guard in _SESSION_RULE_GUARDS:
+        for rule_key in AVAILABLE_SESSION_RULE_KEYS:
+            try:
+                if await guard.owns(umo, rule_key):
+                    await guard.reset(umo, rule_key)
+            except Exception as exc:
+                logger.error(
+                    f"session-rule guard {type(guard).__name__} failed to "
+                    f"restore {rule_key} for umo {umo}: {exc!s}"
+                )
+
+
+async def _guard_for(umo: str, rule_key: str) -> SessionRuleGuard | None:
+    """The registered guard claiming ``rule_key`` for ``umo``, if any.
+
+    A guard that raises is treated as claiming the key: failing open here
+    would silently restore the very bypass the guard exists to prevent.
+    """
+    for guard in _SESSION_RULE_GUARDS:
+        try:
+            if await guard.owns(umo, rule_key):
+                return guard
+        except Exception as exc:
+            logger.error(
+                f"session-rule guard {type(guard).__name__} failed on "
+                f"{rule_key} for umo {umo}, treating the key as guarded: {exc!s}"
+            )
+            return guard
+    return None
 
 
 class SessionManagementServiceError(Exception):
@@ -254,6 +346,9 @@ class SessionManagementService:
             raise SessionManagementServiceError("缺少必要参数: rule_key")
         if rule_key not in AVAILABLE_SESSION_RULE_KEYS:
             raise SessionManagementServiceError(f"不支持的规则键: {rule_key}")
+        guard = await _guard_for(umo, rule_key)
+        if guard is not None:
+            raise SessionManagementServiceError(guard.refusal_message)
 
         if rule_key == "session_plugin_config":
             rule_value = {umo: rule_value}
@@ -272,10 +367,17 @@ class SessionManagementService:
         if rule_key:
             if rule_key not in AVAILABLE_SESSION_RULE_KEYS:
                 raise SessionManagementServiceError(f"不支持的规则键: {rule_key}")
-            await sp.session_remove(umo, rule_key)
+            guard = await _guard_for(umo, rule_key)
+            if guard is not None:
+                # Removing a guarded key may not mean what the caller
+                # expects; let its owner write the safe value instead.
+                await guard.reset(umo, rule_key)
+            else:
+                await sp.session_remove(umo, rule_key)
             return {"message": f"规则 {rule_key} 已删除", "umo": umo}
 
         await sp.clear_async("umo", umo)
+        await _restore_guarded_keys(umo)
         return {"message": "所有规则已删除", "umo": umo}
 
     async def delete_session_rules(self, data: object) -> dict:
@@ -306,9 +408,14 @@ class SessionManagementService:
         for umo in umos:
             try:
                 if rule_key:
-                    await sp.session_remove(umo, rule_key)
+                    guard = await _guard_for(umo, rule_key)
+                    if guard is not None:
+                        await guard.reset(umo, rule_key)
+                    else:
+                        await sp.session_remove(umo, rule_key)
                 else:
                     await sp.clear_async("umo", umo)
+                    await _restore_guarded_keys(umo)
                 success_count += 1
             except Exception as exc:
                 logger.error(f"删除 umo {umo} 的规则失败: {exc!s}")
