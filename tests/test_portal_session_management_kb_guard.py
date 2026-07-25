@@ -33,6 +33,53 @@ pins both:
 Follows the established convention of exercising the real process-wide
 ``astrbot.core.sp`` singleton rather than mocking it, with a fresh uuid in every
 umo so tests cannot collide on the shared keyspace.
+
+---
+
+**Phase 4 extension.** The guard (still named ``PortalKbConfigGuard`` --
+unchanged from Phase 3 for import-compatibility reasons documented in its own
+module docstring) now also claims two more keys reachable through the same
+route:
+
+3. ``session_service_config`` -- its ``persona_id`` sub-key is a
+   **force-applied** persona (``PersonaManager.resolve_selected_persona``,
+   ``astrbot/core/persona_mgr.py``, reads it *before* falling back to the
+   conversation's own persona). This is the exact surface Phase 4's Agent
+   Bundle feature would otherwise be shadowed through: a data-scope caller
+   could force an arbitrary persona onto a Portal session regardless of
+   whatever bundle the end user selected (which applies its persona via
+   ``conv_mgr.update_conversation``, a different, lower-priority surface).
+4. ``provider_perf_chat_completion`` -- the per-umo chat-provider preference
+   (``ProviderManager.get_using_provider`` reads it before the operator's own
+   ``default_provider_id``). This is the "spend-redirection bypass": left
+   open, a data-scope caller could point a Portal session's spend at any
+   provider configured on the instance, entirely bypassing the Agent
+   Bundle's own resolution.
+
+Per-key ``reset`` semantics differ (see ``session_rule_guard.py``'s own
+module docstring for the full rationale):
+
+* ``session_service_config`` is refused WHOLESALE at write time -- the
+  ``SessionRuleGuard`` protocol never hands ``owns`` the value being
+  written, so there is no way to claim the key "only when the write
+  touches persona_id"; claiming it at all necessarily refuses every write
+  through this route for this key, including one that only meant to touch
+  some other sub-key. ``reset`` (the delete path), however, IS surgical: it
+  removes only the ``persona_id`` sub-key, leaving
+  ``llm_enabled``/``tts_enabled``/every other sub-key untouched.
+* ``provider_perf_chat_completion`` -- absence is SAFE (``get_using_provider``
+  already falls through to the operator's own default), so ``reset``
+  performs a plain removal, mirroring ``kb_config``'s Phase-3 write-refusal
+  shape but NOT its "reset writes an explicit safe value" shape.
+
+``session_rule_guard.py``'s ``reset()`` for both new keys calls
+``core_facade.reset_session_persona_override``/``core_facade.
+clear_chat_provider_preference_for_umo`` -- both now implemented in
+``core_facade.py`` (added during Phase 4 verification, alongside the
+existing ``write_default_kb_config_for_umo``), so the delete-path tests for
+these two keys (``test_delete_session_rule_session_service_config_resets_persona_only``
+and ``test_delete_session_rule_provider_perf_chat_completion_is_cleared``)
+exercise the real reset behaviour end-to-end rather than being xfailed.
 """
 
 from __future__ import annotations
@@ -332,6 +379,279 @@ async def test_batch_delete_full_clear_mixed_umos(
 
 
 # ---------------------------------------------------------------------------
+# Phase 4 extension: identification for the two new keys.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_guard_claims_new_keys_only_for_real_portal_users(portal_user: str):
+    guard = session_rule_guard.PortalKbConfigGuard()
+
+    assert await guard.owns(_portal_umo(portal_user), "session_service_config") is True
+    assert (
+        await guard.owns(_portal_umo(portal_user), "provider_perf_chat_completion")
+        is True
+    )
+    # Same regression this file already pins for kb_config: the operator's
+    # own test chat (same webchat platform, different -- non-portal --
+    # creator) must not be claimed for either new key either.
+    assert (
+        await guard.owns(_operator_testchat_umo(), "session_service_config") is False
+    )
+    assert (
+        await guard.owns(_operator_testchat_umo(), "provider_perf_chat_completion")
+        is False
+    )
+    assert await guard.owns(_non_portal_umo(), "session_service_config") is False
+    assert (
+        await guard.owns(_non_portal_umo(), "provider_perf_chat_completion") is False
+    )
+    # A rule key this guard does not claim at all is still correctly refused
+    # for a real portal umo, even after widening to three keys.
+    assert (
+        await guard.owns(_portal_umo(portal_user), "session_plugin_config") is False
+    )
+
+
+# ---------------------------------------------------------------------------
+# Blocker 3: session_service_config is refused WHOLESALE for portal
+# sessions -- the persona-shadowing bypass Phase 4's Agent Bundle feature
+# needs closed (a data-scope caller could otherwise force
+# session_service_config['persona_id'] and override a bundle's own
+# conv_mgr-applied persona).
+# ---------------------------------------------------------------------------
+
+
+async def _get_session_service_config(umo: str):
+    return await sp.session_get(umo, "session_service_config", default=_MISSING)
+
+
+@pytest.mark.asyncio
+async def test_update_session_rule_refuses_session_service_config_for_portal_session(
+    service: SessionManagementService, registered_guard: str
+):
+    umo = _portal_umo(registered_guard)
+    baseline = await _get_session_service_config(umo)
+
+    with pytest.raises(SessionManagementServiceError):
+        await service.update_session_rule(
+            {
+                "umo": umo,
+                "rule_key": "session_service_config",
+                "rule_value": {"persona_id": "attacker-forced-persona"},
+            }
+        )
+
+    assert await _get_session_service_config(umo) == baseline, (
+        "a refused write must not have mutated sp at all"
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_session_rule_refuses_session_service_config_even_for_non_persona_write(
+    service: SessionManagementService, registered_guard: str
+):
+    """The guard's own documented cost (module docstring, ``session_rule_guard.py``):
+    it cannot distinguish a persona-touching write from any other write to
+    this key, because ``owns`` is never handed the ``rule_value``. This test
+    pins that documented, deliberate over-refusal rather than assuming a
+    narrower, unimplementable scope."""
+    umo = _portal_umo(registered_guard)
+    baseline = await _get_session_service_config(umo)
+
+    with pytest.raises(SessionManagementServiceError):
+        await service.update_session_rule(
+            {
+                "umo": umo,
+                "rule_key": "session_service_config",
+                "rule_value": {"llm_enabled": False},
+            }
+        )
+
+    assert await _get_session_service_config(umo) == baseline
+
+
+@pytest.mark.asyncio
+async def test_update_session_rule_still_allows_operator_testchat_session_service_config(
+    service: SessionManagementService, registered_guard: str
+):
+    umo = _operator_testchat_umo()
+    await service.update_session_rule(
+        {
+            "umo": umo,
+            "rule_key": "session_service_config",
+            "rule_value": {"persona_id": "operator-chosen-persona"},
+        }
+    )
+    assert await _get_session_service_config(umo) == {
+        "persona_id": "operator-chosen-persona"
+    }
+
+
+@pytest.mark.asyncio
+async def test_update_session_rule_session_service_config_unaffected_for_other_platforms(
+    service: SessionManagementService, registered_guard: str
+):
+    umo = _non_portal_umo()
+    await service.update_session_rule(
+        {
+            "umo": umo,
+            "rule_key": "session_service_config",
+            "rule_value": {"persona_id": "some-persona"},
+        }
+    )
+    assert await _get_session_service_config(umo) == {"persona_id": "some-persona"}
+
+
+# ---------------------------------------------------------------------------
+# Blocker 4: provider_perf_chat_completion is refused for portal sessions --
+# the spend-redirection bypass.
+# ---------------------------------------------------------------------------
+
+
+async def _get_provider_pref(umo: str):
+    return await sp.session_get(umo, "provider_perf_chat_completion", default=_MISSING)
+
+
+@pytest.mark.asyncio
+async def test_update_session_rule_refuses_provider_perf_chat_completion_for_portal_session(
+    service: SessionManagementService, registered_guard: str
+):
+    umo = _portal_umo(registered_guard)
+    baseline = await _get_provider_pref(umo)
+
+    with pytest.raises(SessionManagementServiceError):
+        await service.update_session_rule(
+            {
+                "umo": umo,
+                "rule_key": "provider_perf_chat_completion",
+                "rule_value": "attacker-chosen-expensive-provider",
+            }
+        )
+
+    assert await _get_provider_pref(umo) == baseline, (
+        "a refused write must not have mutated sp at all -- this is "
+        "specifically the spend-redirection bypass this phase closes"
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_session_rule_still_allows_operator_testchat_provider_perf_chat_completion(
+    service: SessionManagementService, registered_guard: str
+):
+    umo = _operator_testchat_umo()
+    await service.update_session_rule(
+        {
+            "umo": umo,
+            "rule_key": "provider_perf_chat_completion",
+            "rule_value": "operator-chosen-provider",
+        }
+    )
+    assert await _get_provider_pref(umo) == "operator-chosen-provider"
+
+
+@pytest.mark.asyncio
+async def test_update_session_rule_provider_perf_chat_completion_unaffected_for_other_platforms(
+    service: SessionManagementService, registered_guard: str
+):
+    umo = _non_portal_umo()
+    await service.update_session_rule(
+        {
+            "umo": umo,
+            "rule_key": "provider_perf_chat_completion",
+            "rule_value": "some-provider",
+        }
+    )
+    assert await _get_provider_pref(umo) == "some-provider"
+
+
+# ---------------------------------------------------------------------------
+# Delete-path (reset()) behaviour for the two new keys.
+#
+# ``session_rule_guard.py``'s ``reset()`` for
+# ``session_service_config``/``provider_perf_chat_completion`` calls
+# ``core_facade.reset_session_persona_override``/``core_facade.
+# clear_chat_provider_preference_for_umo`` respectively -- both now exist in
+# ``core_facade.py`` (added during Phase 4 verification, next to the
+# pre-existing ``write_default_kb_config_for_umo``, with the exact bodies
+# recorded in this phase's own contracts_for_downstream). These two tests
+# exercise that reset behaviour for real.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_delete_session_rule_session_service_config_resets_persona_only(
+    service: SessionManagementService, registered_guard: str
+):
+    umo = _portal_umo(registered_guard)
+    await sp.session_put(
+        umo,
+        "session_service_config",
+        {"persona_id": "forced-persona", "llm_enabled": False, "tts_enabled": True},
+    )
+
+    await service.delete_session_rule({"umo": umo, "rule_key": "session_service_config"})
+
+    after = await _get_session_service_config(umo)
+    assert "persona_id" not in after, (
+        "reset() must remove only the persona_id sub-key, letting persona "
+        "resolution fall back to the conversation's own persona / the "
+        "Agent Bundle's conv_mgr write"
+    )
+    assert after.get("llm_enabled") is False, (
+        "llm_enabled must survive a session_service_config reset untouched"
+    )
+    assert after.get("tts_enabled") is True, (
+        "tts_enabled must survive a session_service_config reset untouched"
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_session_rule_provider_perf_chat_completion_is_cleared(
+    service: SessionManagementService, registered_guard: str
+):
+    umo = _portal_umo(registered_guard)
+    await sp.session_put(umo, "provider_perf_chat_completion", "forced-provider")
+
+    await service.delete_session_rule(
+        {"umo": umo, "rule_key": "provider_perf_chat_completion"}
+    )
+
+    assert await _get_provider_pref(umo) is _MISSING, (
+        "absence is the safe state for this key -- reset() must remove it "
+        "entirely, never write a placeholder value"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The operator's separate llm_enabled/tts_enabled toggle path
+# (``batch_update_service``) never calls ``_guard_for`` at all (verified
+# ground truth, ``session_management_service.py``'s own body) -- so it must
+# keep working for Portal sessions even though the generic per-key rule
+# editor now refuses ``session_service_config`` outright for them. This is
+# the documented mitigation for that refusal's cost (session_rule_guard.py's
+# own module docstring).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_batch_update_service_llm_tts_toggle_bypasses_the_guard_entirely(
+    service: SessionManagementService, registered_guard: str
+):
+    umo = _portal_umo(registered_guard)
+
+    result = await service.batch_update_service(
+        {"umos": [umo], "llm_enabled": False, "tts_enabled": True}
+    )
+
+    assert result["success_count"] == 1
+    assert result["failed_count"] == 0
+    after = await _get_session_service_config(umo)
+    assert after["llm_enabled"] is False
+    assert after["tts_enabled"] is True
+
+
+# ---------------------------------------------------------------------------
 # Without the portal, core behaves exactly as before
 # ---------------------------------------------------------------------------
 
@@ -389,3 +709,53 @@ async def test_a_guard_that_raises_is_treated_as_owning_the_key(
             {"umo": umo, "rule_key": "kb_config", "rule_value": _ATTACKER_BINDING}
         )
     assert await _get_kb_config(umo) == baseline
+
+
+@pytest.mark.asyncio
+async def test_no_registered_guard_preserves_legacy_write_behaviour_for_new_keys(
+    service: SessionManagementService, no_guard
+):
+    """Phase 4 extension of the "without the portal" guarantee: a deployment
+    that never registers this guard must let ``session_service_config``/
+    ``provider_perf_chat_completion`` writes through for ANY umo, portal-
+    shaped or not, exactly as they always could before this phase existed.
+    """
+    umo = f"webchat:FriendMessage:webchat!{uuid.uuid4().hex}!{uuid.uuid4().hex}"
+    await service.update_session_rule(
+        {
+            "umo": umo,
+            "rule_key": "session_service_config",
+            "rule_value": {"persona_id": "whatever"},
+        }
+    )
+    assert await _get_session_service_config(umo) == {"persona_id": "whatever"}
+
+    await service.update_session_rule(
+        {
+            "umo": umo,
+            "rule_key": "provider_perf_chat_completion",
+            "rule_value": "whatever-provider",
+        }
+    )
+    assert await _get_provider_pref(umo) == "whatever-provider"
+
+
+@pytest.mark.asyncio
+async def test_no_registered_guard_preserves_legacy_delete_behaviour_for_new_keys(
+    service: SessionManagementService, no_guard
+):
+    umo = f"webchat:FriendMessage:webchat!{uuid.uuid4().hex}!{uuid.uuid4().hex}"
+    await sp.session_put(umo, "session_service_config", {"persona_id": "whatever"})
+    await sp.session_put(umo, "provider_perf_chat_completion", "whatever-provider")
+
+    await service.delete_session_rule({"umo": umo, "rule_key": "session_service_config"})
+    await service.delete_session_rule(
+        {"umo": umo, "rule_key": "provider_perf_chat_completion"}
+    )
+
+    assert await _get_session_service_config(umo) is _MISSING, (
+        "with no guard registered the key is removed outright, as it always "
+        "was -- this guard's surgical persona_id-only reset only applies "
+        "when the guard is actually registered"
+    )
+    assert await _get_provider_pref(umo) is _MISSING
