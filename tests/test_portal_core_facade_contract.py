@@ -192,12 +192,17 @@ def test_shared_preferences_put_async_signature():
 # ---------------------------------------------------------------------------
 
 
-def test_core_facade_module_exports_unchanged():
-    # Phase 2 intentionally grew this list (attachment-ownership verification
-    # hook + upload/discard/resolve facade wrappers). Pinned to the current,
-    # deliberate Phase 2 export surface -- update again only for a similarly
-    # deliberate future export change, not silently.
-    assert core_facade.__all__ == [
+# The facade entry points other portal modules import. Removing one breaks a
+# caller silently, so this set is asserted as a *floor*, not an exact match.
+#
+# Deliberately not an equality assertion: pinning the exact list made this test
+# fail on every intended export addition (three times across phases 2 and 3)
+# while never once catching a regression. A floor plus the "every export
+# resolves" check below fails on the things that actually matter -- a removed
+# entry point, or a name listed in __all__ that does not exist -- and stays
+# quiet when the surface legitimately grows.
+_REQUIRED_FACADE_EXPORTS = frozenset(
+    {
         "CoreFacadeError",
         "ResourceNotFoundError",
         "ValidationError",
@@ -219,4 +224,36 @@ def test_core_facade_module_exports_unchanged():
         "discard_orphaned_upload",
         "resolve_attachment",
         "get_chat_configs",
-    ]
+        "set_session_kb_config",
+        "get_session_kb_config",
+        "get_kb_live_info",
+        "get_kb_live_info_batch",
+        "list_all_core_kbs",
+        "write_default_kb_config_for_umo",
+    }
+)
+
+
+def test_core_facade_exports_every_required_entry_point():
+    missing = _REQUIRED_FACADE_EXPORTS - set(core_facade.__all__)
+    assert not missing, (
+        f"core_facade stopped exporting {sorted(missing)}. Callers elsewhere in "
+        "astrbot/portal import these by name; removing one is a silent break. "
+        "If the removal is intentional, update the callers and this set together."
+    )
+
+
+def test_every_declared_facade_export_actually_exists():
+    """A name in ``__all__`` that does not resolve is a typo waiting to become
+    an ImportError in whichever module imports it first."""
+    unresolved = [name for name in core_facade.__all__ if not hasattr(core_facade, name)]
+    assert not unresolved, (
+        f"core_facade.__all__ lists {unresolved}, which the module does not define"
+    )
+
+
+def test_no_duplicate_facade_exports():
+    duplicates = sorted(
+        {name for name in core_facade.__all__ if core_facade.__all__.count(name) > 1}
+    )
+    assert not duplicates, f"core_facade.__all__ lists {duplicates} more than once"
