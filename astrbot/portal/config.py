@@ -211,6 +211,73 @@ class PortalSettings:
     without touching the MIME list) rather than as the primary gate.
     """
 
+    # --- Knowledge-base policy (Phase 3: KB visibility + session binding) ---
+    #
+    # See `astrbot/core/tools/knowledge_base_tools.py:24-87` for the
+    # default-open trap these settings exist alongside: a session with no
+    # explicit `kb_config` silently falls through to the operator's *global*
+    # `kb_names` config, not to "no KB". These settings only govern the
+    # *portal-authorized* binding path (`PortalKbVisibility`, db/models.py) --
+    # they do not by themselves close that trap; the service/route layer
+    # closes it by always writing an explicit `kb_config` (empty `kb_ids` by
+    # default) rather than leaving the key unset. `kb_selection_enabled`
+    # below is the master switch for whether that binding path is even
+    # reachable at all.
+    kb_selection_enabled: bool = True
+    """Whether end users may see/bind any knowledge base at all.
+
+    Defaults on since Phase 3 assumes a deployment that wants the feature,
+    but an operator running a plain chatbot with no KB use case at all
+    should be able to turn the entire surface off with one flag -- when
+    `False`, the KB list/bind routes should refuse the request outright
+    (this module's own choice, not a core one) rather than simply returning
+    an empty whitelist, so the feature is verifiably inert rather than
+    quietly empty.
+    """
+
+    max_kb_ids_per_session: int = 3
+    """Maximum number of distinct `kb_id`s a single session's `kb_config`
+    may bind at once.
+
+    Chosen as a small, deliberately conservative ceiling for a
+    consumer-facing product: `kb_mgr.retrieve` (invoked from
+    `retrieve_knowledge_base`) fans a single query out across every bound
+    KB and concatenates results, so each additional KB directly multiplies
+    retrieval latency and LLM context spent on (often redundant) retrieved
+    chunks for one user turn. Three is enough for a real multi-corpus use
+    case (e.g. "product docs" + "internal FAQ" + "policy handbook"
+    simultaneously) without letting a session silently accumulate the
+    operator's entire whitelist over time and turn every message into a
+    full-catalog fan-out search.
+    """
+
+    default_kb_top_k: int = 5
+    """Default `top_k` applied to a session's `kb_config` when a user binds
+    KBs without specifying one.
+
+    Matches core's own fallback default for the global (non-portal) path
+    (`config.get("kb_final_top_k", 5)` in
+    `astrbot/core/tools/knowledge_base_tools.py`), so a portal-bound session
+    behaves like the operator's existing global-KB behavior in the
+    dimension the portal doesn't have an opinion on, rather than silently
+    picking a different retrieval depth than what the operator is already
+    used to seeing.
+    """
+
+    max_kb_top_k: int = 10
+    """Hard ceiling on the `top_k` a user-facing request may set for their
+    own session's `kb_config`, independent of `default_kb_top_k`.
+
+    `top_k` (unlike `kb_fusion_top_k`, which always comes from global
+    config and is never user-controllable at all -- see
+    `knowledge_base_tools.py`) is read from the *session's own* config, so
+    without a ceiling here a client could request an arbitrarily large
+    `top_k` and turn one chat message into a disproportionately expensive
+    retrieval + a context window stuffed with low-relevance chunks. Set
+    to 2x the default: enough headroom for a user who genuinely wants a
+    broader search on one question, without allowing an unbounded value.
+    """
+
 
 DEFAULT_PORTAL_SETTINGS = PortalSettings()
 

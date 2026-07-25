@@ -21,14 +21,21 @@ columns. Only ``user_id`` foreign keys *within this module's own tables*
 ``PortalAttachmentOwner.user_id`` -> ``PortalUser.user_id``) are declared,
 since those are safe same-database, same-metadata relationships.
 
-``PortalAttachmentOwner`` is the one exception to "no references into core
-tables": it associates with core's ``astrbot.core.db.po.Attachment`` by
-*value* (``attachment_id`` string equality), never by a real SQLAlchemy
-``ForeignKey`` -- core's ``Attachment`` table lives in a completely
-different SQLite database file (``data/data_v4.db`` vs this module's own
-``data/portal/portal.db``), and SQLite has no cross-database-file FK
-mechanism. See the class docstring below for why this table needs to exist
-at all: core's ``Attachment`` has no owner column.
+``PortalAttachmentOwner`` and ``PortalKbVisibility`` are the exceptions to
+"no references into core tables": they associate with core's
+``astrbot.core.db.po.Attachment`` and
+``astrbot.core.knowledge_base.models.KnowledgeBase`` respectively by
+*value* (``attachment_id`` / ``kb_id`` string equality), never by a real
+SQLAlchemy ``ForeignKey`` -- both core tables live in database files
+separate from this module's own (``data/data_v4.db`` and the knowledge-base
+module's own database file, vs this module's ``data/portal/portal.db``),
+and SQLite has no cross-database-file FK mechanism. See each class's
+docstring below for the specific gap each table exists to fill: core's
+``Attachment`` has no owner column at all, and core's ``KnowledgeBase`` is a
+global operator resource with no owner column either -- but for KBs the
+portal doesn't need per-user *ownership*, it needs an admin-curated
+*visibility whitelist*, since every end user shares the same pool of
+operator-provisioned corpora.
 """
 
 from __future__ import annotations
@@ -343,3 +350,101 @@ class PortalAttachmentOwner(PortalBaseModel, table=True):
     docstring for the cross-tenant overwrite bug this field exists to
     prevent."""
     created_at: datetime = Field(default_factory=_utcnow, nullable=False)
+
+
+class PortalKbVisibility(PortalBaseModel, table=True):
+    """Admin-curated whitelist of knowledge bases end users may select.
+
+    Core's knowledge bases (``astrbot.core.knowledge_base.models.KnowledgeBase``,
+    ``kb_id``/``kb_name`` at ``astrbot/core/knowledge_base/models.py:24,31``) are
+    **global operator resources with no owner column** -- unlike
+    ``PortalAttachmentOwner`` shadowing a per-request core resource that a
+    single user just created, this table is not "who owns this row" but
+    "which of the operator's global corpora has an admin decided end users
+    are even allowed to see at all". It is therefore the *entire*
+    access-control surface for portal KB access: nothing about a KB is
+    exposed to any portal end-user endpoint unless a row exists here with
+    ``enabled=True``. See ``astrbot/core/tools/knowledge_base_tools.py:24-87``
+    for why this matters more than it might look like it should -- a portal
+    session with no explicit ``kb_config`` written falls through to the
+    operator's *global* ``kb_names`` config (a default-open leak), so the
+    portal's session-creation path must always write an explicit
+    ``{"kb_ids": []}`` and every bind attempt must be checked against this
+    table before that list is ever allowed to grow.
+
+    ``kb_id`` associates with core's ``KnowledgeBase.kb_id`` **by value
+    equality only, never by a real SQLAlchemy ``ForeignKey``**: exactly the
+    same cross-database-file constraint documented on
+    ``PortalAttachmentOwner`` above applies here -- core's knowledge-base
+    metadata lives in its own database file (see
+    ``astrbot.core.knowledge_base.models.BaseKBModel.metadata``, a separate
+    ``MetaData()`` instance again, just like this module's own), not in
+    this module's ``data/portal/portal.db``, and SQLite cannot enforce an
+    FK across separate database connections/files.
+    """
+
+    __tablename__ = "portal_kb_visibilities"  # type: ignore
+
+    id: int | None = Field(
+        default=None,
+        primary_key=True,
+        sa_column_kwargs={"autoincrement": True},
+    )
+    kb_id: str = Field(max_length=36, nullable=False, unique=True, index=True)
+    """Same string as core's ``KnowledgeBase.kb_id`` (a 36-char uuid). Unique
+    and indexed: this table holds at most one visibility row per core KB,
+    and the primary lookup shape everywhere (route authorization checks,
+    the "list visible KBs" query) is by this value, never by the surrogate
+    ``id`` above."""
+    kb_name: str = Field(max_length=100, nullable=False)
+    """A cached copy of core's ``KnowledgeBase.kb_name`` (also max 100 there,
+    see ``astrbot/core/knowledge_base/models.py:31``), captured at the time
+    an admin whitelists this ``kb_id``, so the admin's own visibility-list
+    UI can render a recognizable name without an extra cross-database join
+    on every page load. This value **can go stale**: if the operator later
+    renames the KB in core, this column does not update automatically --
+    there is no event/webhook wiring core's KB rename path back into this
+    table. The expected remedy is operational, not automatic: the admin
+    visibility-list UI (Phase 3's admin page) is expected to re-fetch core's
+    live KB list on load and diff it against this cached value, prompting
+    the admin to refresh/re-save the row if it drifts, rather than this
+    table silently self-healing. Consumer-facing surfaces should prefer
+    ``display_name`` when set (see below) over this field precisely because
+    this one is an operator-corpus name that can drift, not a
+    consumer-facing label."""
+    enabled: bool = Field(default=True, nullable=False)
+    """Whether this KB is currently selectable by end users. Kept as a flag
+    rather than deleting the row on revocation so that revoking visibility
+    preserves the row's audit trail (``created_at``/``updated_at``/
+    ``granted_by``) instead of losing history of who granted it and when;
+    every portal-facing "list visible KBs" and "bind this kb_id" check must
+    filter on ``enabled == True`` in addition to the row merely existing."""
+    display_name: str | None = Field(default=None, max_length=100)
+    """Optional consumer-facing name to show end users instead of the raw
+    operator-facing ``kb_name`` cache above -- an internal corpus is often
+    named something like ``internal-eng-runbooks-v2`` that means nothing
+    (or means the wrong thing) to an end user, so an admin can set a
+    friendlier label here. Falls back to ``kb_name`` when unset."""
+    description: str | None = Field(default=None, max_length=1000)
+    """Optional consumer-facing description of what this KB covers, shown
+    alongside ``display_name``/``kb_name`` in the end-user KB picker so a
+    user can decide which KB(s) to bind without operator-internal context."""
+    granted_by: str | None = Field(default=None, max_length=255)
+    """The operator identity that (most recently) granted/updated this
+    row's visibility, sourced cheaply from the admin route's
+    ``AuthContext.username`` (``astrbot/dashboard/api/auth.py``'s
+    ``require_system_scope`` dependency) at write time -- a plain string,
+    not a foreign key, since dashboard admin identities are not rows in
+    this module's own tables (they are not ``PortalUser``s at all; the two
+    identity systems are independent by design, see the module's Phase 1
+    capability-wall notes). Nullable because the column must reconcile
+    additively onto an already-created table via ``engine.py``'s
+    ``_add_missing_columns`` if this field is ever added after initial
+    rollout, and because it is informational/audit-only, never used in an
+    authorization decision."""
+    created_at: datetime = Field(default_factory=_utcnow, nullable=False)
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        nullable=False,
+        sa_column_kwargs={"onupdate": _utcnow},
+    )
