@@ -2,6 +2,8 @@
 
 from fastapi import APIRouter
 
+from astrbot.webui.api.router import webui_router
+
 from .api_keys import router as api_keys_router
 from .auth import router as auth_router
 from .backups import router as backups_router
@@ -60,4 +62,8 @@ def build_api_router() -> APIRouter:
     router.include_router(updates_router)
     router.include_router(open_api_router)
     router.include_router(live_chat_router)
+    # WebUI module (multi-user end-user chat frontend/backend): the module's
+    # own auth/chat routes, aggregated under /webui by webui_router, so they
+    # land at /api/v1/webui/* once this router applies API_V1_PREFIX above.
+    router.include_router(webui_router)
     return router
