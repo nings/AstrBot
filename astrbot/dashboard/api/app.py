@@ -40,6 +40,7 @@ from astrbot.dashboard.services.plugin_page_service import PluginPageService
 from astrbot.dashboard.services.plugin_service import PluginService
 from astrbot.dashboard.services.session_management_service import (
     SessionManagementService,
+    register_session_rule_guard,
 )
 from astrbot.dashboard.services.skills_service import SkillsService
 from astrbot.dashboard.services.stat_service import StatService
@@ -54,9 +55,14 @@ from astrbot.dashboard.services.update_service import (
     call_get_dashboard_version,
     call_pip_install,
 )
+from astrbot.portal import session_rule_guard as portal_session_rule_guard
 from astrbot.portal.api.static_router import router as portal_static_router
 from astrbot.portal.db import engine as portal_db_engine
 from astrbot.portal.services import core_facade as portal_core_facade
+from astrbot.portal.startup_checks import (
+    PortalUmoRoutingUnisolatedError,
+    check_umo_routing,
+)
 
 from .api_keys import legacy_router as legacy_api_keys_router
 from .auth import legacy_router as legacy_auth_router
@@ -115,14 +121,40 @@ async def init_portal_module_state(app: FastAPI) -> None:
     await portal_db_engine.init_portal_db()
     app.state.portal_jwt_secret = await portal_core_facade.get_jwt_secret()
 
+    # 3. The portal claims the `kb_config` session rule. Core's
+    #    /api/v1/sessions/rules route is gated only by require_data_scope and
+    #    knows nothing about the portal's KB whitelist, so without this guard
+    #    that route can bind arbitrary knowledge bases to a portal session, or
+    #    delete the key and re-open the global-KB fallback. Registration is
+    #    inverted deliberately: core exposes the hook and the portal fills it,
+    #    so no core service imports this module.
+    portal_session_rule_guard.register(register_session_rule_guard)
+
 
 @asynccontextmanager
 async def _dashboard_lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """FastAPI ``lifespan`` handler: currently only wires up the portal
-    module's runtime state (see ``init_portal_module_state``) on startup.
-    Nothing needs to run on shutdown yet.
+    """FastAPI ``lifespan`` handler: wires up the portal module's runtime
+    state (see ``init_portal_module_state``) and runs its Phase 3 umo
+    routing isolation health check on startup. Nothing needs to run on
+    shutdown yet.
     """
     await init_portal_module_state(app)
+
+    # Portal Phase 3: log (on every start, success or failure) whether
+    # portal traffic routes to an isolated AstrBotConfig profile -- see
+    # astrbot/portal/startup_checks.py for the full rationale and the
+    # CRITICAL remediation logged when it does not. refuse_to_start is not
+    # wired to any operator-facing setting yet (no such PortalSettings
+    # field exists); it defaults to False, so a failing check only warns
+    # loudly and never aborts startup by itself.
+    try:
+        check_umo_routing(app.state.core_lifecycle.umop_config_router)
+    except PortalUmoRoutingUnisolatedError:
+        # Unreachable while refuse_to_start defaults to False above; kept
+        # so this still aborts startup correctly if a future change ever
+        # passes refuse_to_start=True here.
+        raise
+
     yield
 
 
