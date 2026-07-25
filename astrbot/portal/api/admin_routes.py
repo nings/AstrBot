@@ -1,4 +1,5 @@
-"""Operator-only admin HTTP routes for the AstrBot Portal module (Phase 3).
+"""Operator-only admin HTTP routes for the AstrBot Portal module (Phase 3
+KB-visibility CRUD; Phase 4 adds Agent Bundle CRUD below, same conventions).
 
 Every handler here is gated by ``Depends(require_system_scope)`` imported
 **verbatim** from ``astrbot.dashboard.api.auth`` -- the core dashboard's own
@@ -97,7 +98,14 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from astrbot.dashboard.api.auth import AuthContext, require_system_scope
-from astrbot.portal.services import kb_visibility_service
+from astrbot.portal.services import agent_bundle_service, kb_visibility_service
+from astrbot.portal.services.agent_bundle_service import (
+    AgentBundleServiceError,
+    KbNotVisibleError,
+    PersonaNotFoundError,
+    ProviderNotFoundError,
+    TooManyKbIdsError,
+)
 from astrbot.portal.services.core_facade import ResourceNotFoundError
 from astrbot.portal.services.kb_visibility_service import KbAlreadyGrantedError
 
@@ -139,6 +147,49 @@ class UpdateKbVisibilityDisplayRequest(BaseModel):
     description: str | None = Field(default=None, max_length=1000)
 
 
+class UpsertAgentBundleRequest(BaseModel):
+    """Body for ``POST /admin/agent-bundles`` (create) and
+    ``PUT /admin/agent-bundles/{bundle_id}`` (full-replace update).
+
+    This is the ONE place in the whole module an operator picks a persona
+    and a provider from the real core inventory -- exactly the privilege
+    boundary this phase's assignment draws: operators name providers, end
+    users name bundles (see ``agent_routes.py``'s module docstring). Every
+    field is validated against live core state by
+    ``agent_bundle_service._validate_bundle_fields`` before anything is
+    written -- an operator can never save a bundle referencing a persona/
+    provider that does not currently exist, or a ``kb_id`` that is not
+    currently portal-visible.
+
+    ``persona_id``/``chat_provider_id`` being ``None`` is itself meaningful
+    ("this bundle does not touch that dimension" -- see
+    ``PortalAgentBundle``'s own field docstrings), so the update route is a
+    full replace (PUT semantics): every mutable field must be resupplied on
+    every update, there is no partial-patch/``None``-means-unchanged
+    contract here (see ``agent_bundle_service.admin_update``'s own
+    docstring).
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: str = Field(min_length=1, max_length=100)
+    description: str | None = Field(default=None, max_length=1000)
+    persona_id: str | None = Field(default=None, max_length=100)
+    chat_provider_id: str | None = Field(default=None, max_length=100)
+    kb_ids: list[str] = Field(default_factory=list, max_length=100)
+    enabled: bool = True
+    sort_order: int = 0
+    is_default: bool = False
+
+
+class SetAgentBundleEnabledRequest(BaseModel):
+    """Body for ``PATCH /admin/agent-bundles/{bundle_id}/enabled``."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool
+
+
 # ---------------------------------------------------------------------------
 # Error translation. Unlike kb_routes.py, a plain 404 here is NOT an
 # existence-oracle concern: the caller is an authenticated operator whose
@@ -153,6 +204,30 @@ def _raise_for_admin_kb_error(exc: Exception) -> NoReturn:
         raise HTTPException(status_code=404, detail=str(exc) or "Not found") from exc
     if isinstance(exc, KbAlreadyGrantedError):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Error translation for agent-bundle CRUD. ``core_facade.
+# ResourceNotFoundError`` (bundle_id doesn't exist) stays a plain 404 for the
+# same "operator, not an existence-oracle concern" reason as the KB section
+# above. The four ``agent_bundle_service`` validation exceptions below are
+# all admin-CRUD-time input-validation failures -- distinct from the 404
+# used for "bundle_id doesn't exist" -- mapped to 400 per this phase's
+# upstream contract (agent_bundle_service.py's own notes_for_integrator).
+# ---------------------------------------------------------------------------
+
+
+def _raise_for_admin_bundle_error(exc: Exception) -> NoReturn:
+    if isinstance(exc, ResourceNotFoundError):
+        raise HTTPException(status_code=404, detail=str(exc) or "Not found") from exc
+    if isinstance(
+        exc,
+        (PersonaNotFoundError, ProviderNotFoundError, KbNotVisibleError, TooManyKbIdsError),
+    ):
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if isinstance(exc, AgentBundleServiceError):
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
@@ -267,6 +342,141 @@ async def update_kb_visibility_display(
         )
     except ResourceNotFoundError as exc:
         _raise_for_admin_kb_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Agent Bundle CRUD (Phase 4). Matches the shape and conventions of the
+# KB-visibility CRUD above rather than inventing a second style: static
+# sub-paths declared before parametrized ones, ``PUT`` for full-replace
+# update, ``PATCH`` for the narrow enable/disable toggle, ``granted_by``/
+# ``updated_by`` sourced from ``AuthContext.username`` -- never from the
+# request body -- exactly like ``granted_by`` above.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/agent-bundles")
+async def list_agent_bundles(
+    request: Request,
+    _auth: AuthContext = Depends(require_system_scope),
+) -> dict[str, Any]:
+    """Every ``PortalAgentBundle`` row (enabled or not), joined with live
+    reference-health status -- including dangling rows whose ``persona_id``/
+    ``chat_provider_id`` no longer resolves in core, or whose ``kb_ids``
+    include one or more entries no longer ``PortalKbVisibility.enabled``.
+    Unlike the end-user ``GET /agent-bundles`` route, this is the operator's
+    full-inventory view (including ``persona_id``/``chat_provider_id``/
+    ``kb_ids``) precisely so a broken/stale entry can be seen and fixed, not
+    silently hidden -- see ``agent_bundle_service._admin_entry``'s own
+    docstring for the exact shape.
+    """
+    entries = await agent_bundle_service.admin_list_all(request)
+    return {"agent_bundles": entries}
+
+
+@router.get("/agent-bundles/{bundle_id}")
+async def get_agent_bundle(
+    bundle_id: str,
+    request: Request,
+    _auth: AuthContext = Depends(require_system_scope),
+) -> dict[str, Any]:
+    """A single bundle row (enabled or not) with live status, for an admin
+    detail/edit view. 404 if ``bundle_id`` does not exist."""
+    try:
+        return await agent_bundle_service.admin_get(request, bundle_id)
+    except ResourceNotFoundError as exc:
+        _raise_for_admin_bundle_error(exc)
+
+
+@router.post("/agent-bundles")
+async def create_agent_bundle(
+    payload: UpsertAgentBundleRequest,
+    request: Request,
+    auth: AuthContext = Depends(require_system_scope),
+) -> dict[str, Any]:
+    """Create a new bundle. The operator picks ``persona_id``/
+    ``chat_provider_id`` from the real core inventory and ``kb_ids`` from
+    the ``PortalKbVisibility`` whitelist here -- this is exactly the
+    privilege boundary this phase's assignment draws (operators name
+    providers, end users name bundles). 400 if ``persona_id``/
+    ``chat_provider_id`` does not currently exist in core, if any ``kb_id``
+    is not currently portal-visible, or if ``kb_ids`` exceeds
+    ``PortalSettings.max_kb_ids_per_bundle``. ``updated_by`` is sourced from
+    ``AuthContext.username`` -- the authenticated operator's own identity
+    from the verified scope check -- never from the request body.
+    """
+    try:
+        return await agent_bundle_service.admin_create(
+            request,
+            name=payload.name,
+            description=payload.description,
+            persona_id=payload.persona_id,
+            chat_provider_id=payload.chat_provider_id,
+            kb_ids=payload.kb_ids,
+            enabled=payload.enabled,
+            sort_order=payload.sort_order,
+            is_default=payload.is_default,
+            updated_by=auth.username,
+        )
+    except (ResourceNotFoundError, AgentBundleServiceError) as exc:
+        _raise_for_admin_bundle_error(exc)
+
+
+@router.put("/agent-bundles/{bundle_id}")
+async def update_agent_bundle(
+    bundle_id: str,
+    payload: UpsertAgentBundleRequest,
+    request: Request,
+    auth: AuthContext = Depends(require_system_scope),
+) -> dict[str, Any]:
+    """Full-replace update of an existing bundle (PUT semantics -- see
+    ``UpsertAgentBundleRequest``'s own docstring: every mutable field must
+    be resupplied on every update, since ``persona_id``/``chat_provider_id``
+    being ``None`` is itself meaningful and there is no spare sentinel left
+    for "leave unchanged"). Same validation as create runs again here,
+    against the NEW proposed values. 404 if ``bundle_id`` does not exist;
+    400 for the same validation failures as create.
+    """
+    try:
+        return await agent_bundle_service.admin_update(
+            request,
+            bundle_id,
+            name=payload.name,
+            description=payload.description,
+            persona_id=payload.persona_id,
+            chat_provider_id=payload.chat_provider_id,
+            kb_ids=payload.kb_ids,
+            enabled=payload.enabled,
+            sort_order=payload.sort_order,
+            is_default=payload.is_default,
+            updated_by=auth.username,
+        )
+    except (ResourceNotFoundError, AgentBundleServiceError) as exc:
+        _raise_for_admin_bundle_error(exc)
+
+
+@router.patch("/agent-bundles/{bundle_id}/enabled")
+async def set_agent_bundle_enabled(
+    bundle_id: str,
+    payload: SetAgentBundleEnabledRequest,
+    request: Request,
+    auth: AuthContext = Depends(require_system_scope),
+) -> dict[str, Any]:
+    """Enable or disable a bundle without touching any other field.
+
+    Never deletes the row (mirrors ``PortalKbVisibility.enabled``'s own
+    audit-trail rationale, and there is no ``admin_delete`` for
+    ``PortalAgentBundle`` -- see ``agent_bundle_service.py``'s own gaps
+    section). Disabling a bundle a session already has bound leaves that
+    session's already-applied persona/provider/KB state untouched; it
+    simply drops out of the end-user ``GET /agent-bundles`` list and can no
+    longer be freshly selected. 404 if ``bundle_id`` does not exist.
+    """
+    try:
+        return await agent_bundle_service.admin_set_enabled(
+            request, bundle_id, payload.enabled, updated_by=auth.username
+        )
+    except ResourceNotFoundError as exc:
+        _raise_for_admin_bundle_error(exc)
 
 
 __all__ = ["router"]
