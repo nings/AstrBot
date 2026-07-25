@@ -62,6 +62,29 @@ Three hard security invariants enforced everywhere below:
    that same explicit empty binding for any session that predates this
    invariant. See :func:`_ensure_explicit_kb_config`'s own docstring for
    why that backfill fully closes the hole rather than merely narrowing it.
+5. **Agent Bundle bindings never leave a session in a hybrid state
+   (Phase 4).** ``PortalAgentBundle`` (``db/models.py``) is the only thing
+   an end user ever names when "choosing an agent" -- never a persona id,
+   provider id, or kb_id directly (rule 6). This module resolves what a
+   bundle *means* into exactly two core-side binding surfaces --
+   :func:`set_session_persona` (``conv_mgr.update_conversation(persona_id=
+   ...)``) and :func:`set_session_provider` (the per-umo ``sp`` key
+   ``provider_perf_chat_completion``) -- and both accept ``None`` to mean
+   "this dimension has no bundle-forced value right now", resolving that
+   to a fully-determined, deterministic state (the operator's own default
+   persona; no per-umo provider preference at all) rather than silently
+   leaving behind whatever a *previously* selected bundle wrote. This
+   matters specifically when a session switches from one bundle to
+   another: without this, a dimension the new bundle is silent on could
+   keep showing the *old* bundle's value forever -- a state that was never
+   any single operator-configured combination. See each function's own
+   docstring for the core ground truth backing its specific reset
+   behaviour (the two dimensions are NOT symmetric: persona requires an
+   explicit resolved value because core's own ``update_conversation``
+   treats ``persona_id=None`` as "leave unchanged", never "clear"; provider
+   requires *removing* the per-umo key because ``get_using_provider``
+   already treats an absent key as "fall through to the operator's
+   default" by construction).
 """
 
 from __future__ import annotations
@@ -251,8 +274,11 @@ class ChatConfigs:
     :func:`get_chat_configs`) rather than being a static constant, so the
     operator's master switch actually turns the front-end affordance off."""
     agent_bundles: bool = False
-    """Phase 4 has not shipped yet; there is no user-facing provider/persona
-    picker in Phase 1 -- the server always resolves the per-umo default."""
+    """Phase 4: mirrors ``PortalSettings.agent_bundle_selection_enabled``
+    (see :func:`get_chat_configs`), exactly like ``knowledge_base`` mirrors
+    ``kb_selection_enabled`` above -- the operator's master switch actually
+    turns the front-end bundle-picker affordance off when disabled, rather
+    than this being a static constant."""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -961,12 +987,13 @@ async def get_chat_configs(user_id: str) -> dict[str, Any]:
     """Return the (very small) set of chat capability flags a portal end
     user may see. Deliberately does not expose any provider/model
     inventory or admin configuration -- see module comment above."""
-    del user_id  # No per-user variation in Phase 1; kept for signature
-    # symmetry with every other facade function and to leave room for a
-    # future per-user override (e.g. once PortalAgentBundle ships in Phase 4)
-    # without changing every call site.
+    del user_id  # No per-user variation yet; kept for signature symmetry
+    # with every other facade function and to leave room for a future
+    # per-user override without changing every call site.
+    settings = get_portal_settings()
     return ChatConfigs(
-        knowledge_base=get_portal_settings().kb_selection_enabled
+        knowledge_base=settings.kb_selection_enabled,
+        agent_bundles=settings.agent_bundle_selection_enabled,
     ).to_dict()
 
 
@@ -1170,6 +1197,423 @@ async def write_default_kb_config_for_umo(umo: str) -> None:
     await sp.session_put(umo, "kb_config", _default_kb_config())
 
 
+async def reset_session_persona_override(umo: str) -> None:
+    """Remove a forced ``persona_id`` from ``session_service_config`` for a
+    raw ``umo``, leaving every other sub-key untouched.
+
+    Exists for the session-rule guard (``astrbot/portal/session_rule_guard.py``),
+    which is handed a umo string by core's session-rule delete route rather
+    than an owned session object, and which cannot reach ``sp`` itself --
+    only this module may (capability wall, module docstring).
+
+    ``session_service_config`` is a shared container: besides ``persona_id``
+    it also carries ``llm_enabled``/``tts_enabled``
+    (``astrbot/core/star/session_llm_manager.py``). A blanket replace or
+    removal of the whole key would silently reset those too, so this merges:
+    it pops only the ``persona_id`` sub-key and writes the dict back,
+    letting persona resolution fall back to the conversation's own persona /
+    the Agent Bundle's ``conv_mgr`` write (``PersonaManager.
+    resolve_selected_persona``, ``astrbot/core/persona_mgr.py:75-127``).
+
+    No-ops (no write at all) when there is nothing to remove -- e.g. right
+    after a blanket ``sp`` clear already wiped the umo, or when no override
+    was ever set -- so a reset never manufactures an empty dict where none
+    existed.
+    """
+    existing = await sp.session_get(umo, "session_service_config", default=None)
+    if not isinstance(existing, dict) or "persona_id" not in existing:
+        return
+    existing = dict(existing)
+    existing.pop("persona_id", None)
+    await sp.session_put(umo, "session_service_config", existing)
+
+
+async def clear_chat_provider_preference_for_umo(umo: str) -> None:
+    """Remove the ``provider_perf_chat_completion`` per-umo preference for a
+    raw ``umo``.
+
+    Exists for the session-rule guard, same reasoning as
+    :func:`reset_session_persona_override`. Plain removal, not a placeholder
+    write -- absence is the safe state for this key:
+    ``ProviderManager.get_using_provider`` (``astrbot/core/provider/
+    manager.py:215-245``) already treats a missing/unresolvable per-umo key
+    as "fall through to the operator's ``default_provider_id``", so this
+    mirrors exactly what a non-guarded ``session_remove`` would have done.
+    """
+    await sp.session_remove(umo, _PROVIDER_PERF_CHAT_COMPLETION_KEY)
+
+
+# ---------------------------------------------------------------------------
+# Agent Bundle bindings (Phase 4). See module docstring invariant 5 and
+# ``PortalAgentBundle``'s own docstring (db/models.py) for the full picture.
+# Everything below is deliberately "dumb" in exactly the same sense
+# ``set_session_kb_config`` is: no whitelist/existence validation of its own
+# -- ``agent_bundle_service.py`` MUST resolve and validate a bundle (enabled,
+# every referenced persona/provider/kb_id still exists, kb_ids still
+# ``PortalKbVisibility``-whitelisted) *before* ever calling any of these
+# write functions, and MUST apply all of them for one bundle-selection
+# before considering the operation done (all-or-nothing -- see that
+# module's own docstring).
+#
+# Persona and provider are NOT symmetric (module docstring invariant 5
+# explains why); read each function's own docstring rather than assuming
+# they mirror each other.
+# ---------------------------------------------------------------------------
+
+
+def _persona_manager(request: Request):
+    """The process-wide ``PersonaManager`` instance -- same duck-typed
+    access pattern as :func:`_kb_manager`, no separate import of
+    ``PersonaManager`` needed (the capability wall's "may import
+    ``astrbot.core.persona_mgr``" allowance is a ceiling, not a
+    requirement; this module already satisfies every Phase 4 need through
+    plain attribute access off the same already-constructed
+    ``core_lifecycle``, exactly like ``_kb_manager``/``_chat_service``)."""
+    return request.app.state.core_lifecycle.persona_mgr
+
+
+def _provider_manager(request: Request):
+    """The process-wide ``ProviderManager`` instance. See :func:`_persona_manager`."""
+    return request.app.state.core_lifecycle.provider_manager
+
+
+async def _ensure_conversation_id(chat_service: ChatService, umo: str) -> str:
+    """Return an existing (verified-to-exist) conversation id for ``umo``,
+    creating one if necessary.
+
+    Mirrors ``astr_main_agent._get_session_conv``'s own get-or-create dance
+    (``astrbot/core/astr_main_agent.py:255-269``) exactly: a brand-new
+    portal session has no conversation at all until its first message
+    (``create_session`` never creates one -- verified ground truth,
+    ``ChatService.new_session``), and ``ConversationManager.
+    session_conversations``'s in-memory cache can point at a
+    ``conversation_id`` for a conversation that was since deleted
+    out-of-band. Without re-verifying existence, a persona write here could
+    silently target a conversation row that is no longer there --
+    ``ConversationManager.update_conversation`` performs no existence check
+    of its own before issuing its ``UPDATE ... WHERE conversation_id = cid``.
+    """
+    conv_mgr = chat_service.conv_mgr
+    conversation_id = await conv_mgr.get_curr_conversation_id(umo)
+    if conversation_id and await conv_mgr.get_conversation(umo, conversation_id):
+        return conversation_id
+    return await conv_mgr.new_conversation(umo, _WEBCHAT_PLATFORM_ID)
+
+
+async def persona_exists(request: Request, persona_id: str) -> bool:
+    """Whether ``persona_id`` currently resolves to a real persona in core.
+
+    Uses ``PersonaManager.get_persona_v3_by_id`` -- the exact same lookup
+    ``resolve_selected_persona``/``astr_main_agent`` themselves use to
+    decide whether a persona id is "real", including the special-cased
+    always-exists ``"default"`` id. Returns a plain ``bool``, never the
+    live ``Personality`` object -- ``agent_bundle_service.py`` (the only
+    permitted caller) may not reach ``persona_mgr`` itself (capability
+    wall) and must never receive anything beyond "does this exist right
+    now" from this module.
+    """
+    if not persona_id:
+        return False
+    return _persona_manager(request).get_persona_v3_by_id(persona_id) is not None
+
+
+async def get_persona_existence_batch(
+    request: Request, persona_ids: Sequence[str]
+) -> dict[str, bool]:
+    """Batch form of :func:`persona_exists`: one entry per unique id in
+    ``persona_ids``. Not a database query at all -- ``personas_v3`` is an
+    in-memory list -- so this just avoids callers (the admin bundle-list
+    dangling-status view) re-implementing the same loop themselves.
+    """
+    persona_mgr = _persona_manager(request)
+    result: dict[str, bool] = {}
+    for persona_id in persona_ids:
+        persona_id = str(persona_id)
+        if persona_id in result:
+            continue
+        result[persona_id] = persona_mgr.get_persona_v3_by_id(persona_id) is not None
+    return result
+
+
+async def provider_exists(request: Request, provider_id: str) -> bool:
+    """Whether ``provider_id`` currently resolves to a live provider
+    instance in core (``ProviderManager.get_provider_by_id`` -- the exact
+    lookup ``get_using_provider`` itself falls back to for a per-umo
+    preference). Plain ``bool``, never the live provider instance -- a
+    provider object routinely embeds API keys/secrets and must never reach
+    ``agent_bundle_service.py``.
+    """
+    if not provider_id:
+        return False
+    provider = await _provider_manager(request).get_provider_by_id(provider_id)
+    return provider is not None
+
+
+async def get_provider_existence_batch(
+    request: Request, provider_ids: Sequence[str]
+) -> dict[str, bool]:
+    """Batch form of :func:`provider_exists`: one entry per unique id in
+    ``provider_ids``."""
+    provider_mgr = _provider_manager(request)
+    result: dict[str, bool] = {}
+    for provider_id in provider_ids:
+        provider_id = str(provider_id)
+        if provider_id in result:
+            continue
+        provider = await provider_mgr.get_provider_by_id(provider_id)
+        result[provider_id] = provider is not None
+    return result
+
+
+async def set_session_persona(
+    user_id: str, request: Request, session_id: str, persona_id: str | None
+) -> dict[str, Any]:
+    """Force -- or reset -- an owned session's effective persona.
+
+    BINDING SURFACE (load-bearing choice, see module docstring invariant 5
+    and ``PortalAgentBundle``'s own docstring): writes through
+    ``conv_mgr.update_conversation(persona_id=...)`` -- the conversation's
+    own persona field -- never ``session_service_config['persona_id']``.
+    Ground truth (``PersonaManager.resolve_selected_persona``,
+    ``astrbot/core/persona_mgr.py:75-127``): that function reads
+    ``session_service_config['persona_id']`` FIRST as a *force-applied*
+    override and only falls back to the conversation's own persona when
+    that key is absent. The conversation-level surface is what this
+    phase's plan explicitly specifies for ``agent_routes.py``, and picking
+    it also means this facade never has to read-modify-write a dict shared
+    with unrelated concerns (``llm_enabled``/``tts_enabled`` also live
+    under ``session_service_config``, per ``session_llm_manager.py`` --
+    exactly the trap ``set_session_kb_config``'s neighbours warn about for
+    a *different* shared key). The known, currently-open residual gap this
+    choice leaves (a data-scope caller can still force
+    ``session_service_config['persona_id']`` through core's own
+    ``POST /api/v1/sessions/rules`` route and shadow this binding) is
+    ``session_rule_guard.py``'s to close, not this function's -- see
+    ``PortalAgentBundle``'s docstring for the exact fix shape recorded for
+    whoever extends that guard.
+
+    ``persona_id=None`` means "this session has no bundle-forced persona
+    right now" and is used for BOTH "the bundle being applied doesn't set
+    one" and "the bundle was fully unbound" -- deliberately the same call
+    either way (mirrors :func:`set_session_provider`'s identical shape).
+    Rather than leaving whatever a *previously* selected bundle wrote in
+    place (a hybrid state that is neither this call's outcome nor the
+    operator's default -- exactly what module docstring invariant 5
+    forbids), this resolves and writes the operator's OWN currently
+    configured default persona (``PersonaManager.get_default_persona_v3``)
+    so "no bundle persona" deterministically means the same thing on every
+    call, regardless of what was bound before.
+
+    This is a snapshot, not a live pointer: core's own
+    ``ConversationManager.update_conversation`` -> ``BaseDatabase.
+    update_conversation`` treats ``persona_id=None`` as "leave the column
+    unchanged", never "clear it to ``NULL``" (verified ground truth,
+    ``astrbot/core/db/sqlite.py:396-397`` -- the ``values`` dict is only
+    populated ``if persona_id is not None``). There is therefore no
+    core-provided way to write a real, dynamically-re-resolved "no
+    persona_id at all" back onto a conversation row once one has been set;
+    the closest correct substitute is writing the operator's default
+    persona's *current* name explicitly. If the operator changes their
+    default persona later, an already-unbound session does not
+    retroactively follow that change -- a known, documented limitation of
+    this reset, not an oversight (see ``contracts_for_downstream``).
+
+    Always ensures the target conversation actually exists first (see
+    :func:`_ensure_conversation_id`), since a session created but never
+    yet messaged in has none.
+    """
+    chat_service = _chat_service(request)
+    session = await _owned_session_row(chat_service, user_id, session_id)
+    umo = _session_umo(session)
+    conversation_id = await _ensure_conversation_id(chat_service, umo)
+
+    resolved_persona_id = persona_id
+    if resolved_persona_id is None:
+        default_persona = await _persona_manager(request).get_default_persona_v3(umo=umo)
+        resolved_persona_id = default_persona["name"] if default_persona else "default"
+
+    await chat_service.conv_mgr.update_conversation(
+        unified_msg_origin=umo,
+        conversation_id=conversation_id,
+        persona_id=resolved_persona_id,
+    )
+    logger.info(
+        f"[portal] user {user_id} set persona for session {session_id}: "
+        f"{resolved_persona_id!r} (bundle-forced={persona_id is not None})"
+    )
+    return {"persona_id": resolved_persona_id}
+
+
+_PROVIDER_PERF_CHAT_COMPLETION_KEY = "provider_perf_chat_completion"
+"""Exact key name verified against ``ProviderType.CHAT_COMPLETION.value``
+(``astrbot/core/provider/manager.py``) -- ``ProviderManager.
+get_using_provider`` reads ``f"provider_perf_{provider_type.value}"``, so
+this literal must stay byte-for-byte in sync with that enum value. Kept as
+a plain literal rather than importing ``ProviderType`` (an unnecessary
+capability-wall-adjacent import for one already-verified constant string --
+same reasoning as ``_MEDIA_PART_TYPES`` above)."""
+
+
+async def set_session_provider(
+    user_id: str, request: Request, session_id: str, chat_provider_id: str | None
+) -> dict[str, Any]:
+    """Write -- or remove -- an owned session's per-umo chat-completion
+    provider preference.
+
+    BINDING SURFACE: the ``sp`` key ``provider_perf_chat_completion``
+    (``scope='umo', scope_id=umo``) -- verified ground truth,
+    ``ProviderManager.get_using_provider``
+    (``astrbot/core/provider/manager.py:215-245``): a umo's value under
+    this exact key is read FIRST, before the operator's own
+    ``default_provider_id``. Writing it here is sufficient to steer which
+    provider a portal session's chat turns use, entirely server-side --
+    the client never supplies a provider id anywhere in this call chain
+    (module docstring, invariant 1); ``chat_provider_id`` must already have
+    been resolved from an operator-curated ``PortalAgentBundle`` row by
+    ``agent_bundle_service.py`` before this is ever called. This function
+    performs no existence validation of its own (see :func:`provider_exists`
+    for that check, which callers MUST run first).
+
+    ``chat_provider_id=None`` REMOVES the key entirely rather than writing
+    any sentinel -- unlike persona (:func:`set_session_persona`),
+    ``get_using_provider`` already treats an absent/unresolvable per-umo
+    key as "fall through to the operator's own ``default_provider_id``" by
+    construction (ground truth: ``if provider_id: provider = self.inst_map.
+    get(provider_id)`` then ``if not provider: ... config[...].get(
+    "default_provider_id")``). "Absent is safe" for this dimension by
+    construction, so there is no reset action needed beyond simply never
+    writing (or actively clearing) a value -- do NOT copy
+    :func:`set_session_persona`'s "resolve and write an explicit default"
+    shape here; that would be solving a problem this dimension does not
+    have. This also means calling this with ``None`` is the correct,
+    identical action for BOTH "this bundle does not set a provider
+    preference" and "the bundle was fully unbound".
+    """
+    chat_service = _chat_service(request)
+    session = await _owned_session_row(chat_service, user_id, session_id)
+    umo = _session_umo(session)
+
+    if chat_provider_id:
+        chat_provider_id = str(chat_provider_id)
+        await sp.session_put(umo, _PROVIDER_PERF_CHAT_COMPLETION_KEY, chat_provider_id)
+        logger.info(
+            f"[portal] user {user_id} set chat provider preference for session "
+            f"{session_id}: {chat_provider_id}"
+        )
+        return {"chat_provider_id": chat_provider_id}
+
+    await sp.session_remove(umo, _PROVIDER_PERF_CHAT_COMPLETION_KEY)
+    logger.info(
+        f"[portal] user {user_id} cleared chat provider preference for session "
+        f"{session_id}"
+    )
+    return {"chat_provider_id": None}
+
+
+_AGENT_BUNDLE_SESSION_KEY = "portal_agent_bundle_id"
+"""A portal-private ``sp`` key -- deliberately NOT one of core's own
+recognized session-rule keys (``AVAILABLE_SESSION_RULE_KEYS``,
+``astrbot/dashboard/services/session_management_service.py:16-24``), so
+core's own ``POST /api/v1/sessions/rules`` route (which only ever accepts a
+fixed, closed whitelist of key names) cannot read, write, or clear it at
+all. This module's own bookkeeping of "which bundle is currently selected"
+therefore needs no ``session_rule_guard.py`` registration to stay safe from
+the exact bypass class that route enables for the keys it does recognize --
+unlike ``session_service_config``/``kb_config``/``provider_perf_chat_completion``,
+nothing outside ``agent_bundle_service.py`` (via this module) ever reads or
+writes this key, so there is no other surface to shadow it through."""
+
+
+async def set_session_bundle_id(
+    user_id: str, request: Request, session_id: str, bundle_id: str
+) -> None:
+    """Record which :class:`PortalAgentBundle` an owned session currently
+    has selected.
+
+    Bookkeeping only -- never itself applies persona/provider/KB state; see
+    :func:`set_session_persona`/:func:`set_session_provider`/
+    ``set_session_kb_config`` for the actual binding writes and
+    ``agent_bundle_service.bind_session`` for the all-or-nothing
+    orchestration across all of them. Called last in that orchestration
+    (after every other write has already succeeded) so a session is never
+    observed with this bookkeeping value pointing at a bundle whose
+    persona/provider/KB state was not, in fact, fully applied.
+    """
+    chat_service = _chat_service(request)
+    session = await _owned_session_row(chat_service, user_id, session_id)
+    umo = _session_umo(session)
+    await sp.session_put(umo, _AGENT_BUNDLE_SESSION_KEY, str(bundle_id))
+
+
+async def clear_session_bundle_id(user_id: str, request: Request, session_id: str) -> None:
+    """The "no bundle selected" bookkeeping state.
+
+    Removes the key entirely rather than writing e.g. an empty string --
+    mirrors :func:`set_session_provider`'s "absence is the single safe
+    value" shape for this dimension. There is no shadowing risk to defend
+    against here (see :data:`_AGENT_BUNDLE_SESSION_KEY`'s own docstring),
+    so unlike persona there is nothing to resolve; removal is simply
+    correct on its own.
+    """
+    chat_service = _chat_service(request)
+    session = await _owned_session_row(chat_service, user_id, session_id)
+    umo = _session_umo(session)
+    await sp.session_remove(umo, _AGENT_BUNDLE_SESSION_KEY)
+
+
+async def get_session_agent_bindings(
+    user_id: str, request: Request, session_id: str
+) -> dict[str, Any]:
+    """Read back an owned session's current agent-bundle-related bindings
+    as plain data: ``{"bundle_id", "persona_id", "chat_provider_id"}``.
+
+    ``persona_id``/``chat_provider_id`` reflect exactly what THIS module's
+    own binding surfaces (:func:`set_session_persona`/
+    :func:`set_session_provider`) currently hold -- the conversation's own
+    ``persona_id`` column and the ``provider_perf_chat_completion`` ``sp``
+    key, respectively -- NOT necessarily the value that would actually
+    resolve at chat time if some other caller had separately forced
+    ``session_service_config['persona_id']`` through core's own
+    session-rule route (the documented, currently-open shadowing gap --
+    see ``PortalAgentBundle``'s docstring and module docstring invariant
+    5). This function answers "what did the portal's own bundle feature
+    last write", which is the only thing this module has any authority
+    over; it does not call ``resolve_selected_persona``/
+    ``get_using_provider`` itself.
+
+    ``persona_id`` is ``None`` when the session has no conversation yet
+    (nothing has ever been written -- a brand-new, never-messaged
+    session). ``chat_provider_id`` is ``None`` when no per-umo preference
+    is currently set, whether because none was ever bound or because it
+    was explicitly cleared -- the two are indistinguishable by design,
+    since "absent" is the single safe value for that dimension (see
+    :func:`set_session_provider`). ``bundle_id`` is ``None`` when no
+    bundle is currently selected for this session.
+    """
+    chat_service = _chat_service(request)
+    session = await _owned_session_row(chat_service, user_id, session_id)
+    umo = _session_umo(session)
+
+    conv_mgr = chat_service.conv_mgr
+    persona_id: str | None = None
+    conversation_id = await conv_mgr.get_curr_conversation_id(umo)
+    if conversation_id:
+        conversation = await conv_mgr.get_conversation(umo, conversation_id)
+        if conversation:
+            persona_id = conversation.persona_id
+
+    chat_provider_id = await sp.session_get(
+        umo, _PROVIDER_PERF_CHAT_COMPLETION_KEY, default=None
+    )
+    bundle_id = await sp.session_get(umo, _AGENT_BUNDLE_SESSION_KEY, default=None)
+
+    return {
+        "bundle_id": bundle_id,
+        "persona_id": persona_id,
+        "chat_provider_id": chat_provider_id,
+    }
+
+
 __all__ = [
     "CoreFacadeError",
     "ResourceNotFoundError",
@@ -1198,4 +1642,15 @@ __all__ = [
     "get_kb_live_info_batch",
     "list_all_core_kbs",
     "write_default_kb_config_for_umo",
+    "reset_session_persona_override",
+    "clear_chat_provider_preference_for_umo",
+    "persona_exists",
+    "get_persona_existence_batch",
+    "provider_exists",
+    "get_provider_existence_batch",
+    "set_session_persona",
+    "set_session_provider",
+    "set_session_bundle_id",
+    "clear_session_bundle_id",
+    "get_session_agent_bindings",
 ]
