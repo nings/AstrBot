@@ -46,11 +46,27 @@ Three hard security invariants enforced everywhere below:
    :class:`ValidationError` rather than silently forwarding an unverified
    id. This makes it structurally impossible to call either function with
    an unverified attachment_id by accident.
+4. **No portal session is ever default-open to the operator's global KB
+   corpora (Phase 3).** ``retrieve_knowledge_base``
+   (``astrbot/core/tools/knowledge_base_tools.py:24-87``) treats a session
+   umo with *no* ``kb_config`` key at all as "fall through to the
+   operator's global ``kb_names`` config" -- only a ``kb_config`` that is
+   explicitly present, with an ``kb_ids`` key, means anything at all to
+   that function; an explicit empty ``kb_ids`` list is the only spelling of
+   "this session uses no knowledge base". :func:`create_session` therefore
+   always writes ``{"kb_ids": [], "top_k": ...}`` immediately after
+   creating a session, and :func:`_owned_session_row` (the ownership gate
+   every session-scoped function in this module funnels through, including
+   :func:`send_message`/:func:`regenerate` -- the only two paths that can
+   ever trigger an actual core chat turn for a portal session) backfills
+   that same explicit empty binding for any session that predates this
+   invariant. See :func:`_ensure_explicit_kb_config`'s own docstring for
+   why that backfill fully closes the hole rather than merely narrowing it.
 """
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -59,8 +75,9 @@ from fastapi import Request
 from sqlmodel import col, select
 
 from astrbot.core import logger, sp
+from astrbot.core.platform.message_type import MessageType
 from astrbot.dashboard.services.chat_service import ChatService, ChatServiceError
-from astrbot.portal.config import get_portal_jwt_secret
+from astrbot.portal.config import get_portal_jwt_secret, get_portal_settings
 from astrbot.portal.db.engine import portal_async_sessionmaker
 from astrbot.portal.db.models import PortalAttachmentOwner
 
@@ -230,7 +247,9 @@ class ChatConfigs:
     """Phase 2: uploads are accepted (see ``save_upload``/``resolve_attachment``
     below and ``attachment_service.py`` for the enforcing layer)."""
     knowledge_base: bool = False
-    """Phase 3 has not shipped yet."""
+    """Phase 3: mirrors ``PortalSettings.kb_selection_enabled`` (see
+    :func:`get_chat_configs`) rather than being a static constant, so the
+    operator's master switch actually turns the front-end affordance off."""
     agent_bundles: bool = False
     """Phase 4 has not shipped yet; there is no user-facing provider/persona
     picker in Phase 1 -- the server always resolves the per-umo default."""
@@ -309,6 +328,102 @@ def _translate_chat_service_error(exc: ChatServiceError) -> CoreFacadeError:
     return ValidationError(text)
 
 
+_MISSING_KB_CONFIG = object()
+"""Sentinel distinguishing "key entirely absent" from "key present but an
+empty/falsy value" when reading ``kb_config`` back out of ``sp`` -- see
+:func:`_ensure_explicit_kb_config`, which must only ever backfill on the
+former, never re-write a value a caller genuinely set to something falsy."""
+
+
+def _default_kb_config() -> dict[str, Any]:
+    """The explicit "no knowledge base" binding written for every new
+    session and backfilled onto every pre-Phase-3 one (module docstring,
+    invariant 4)."""
+    return {"kb_ids": [], "top_k": get_portal_settings().default_kb_top_k}
+
+
+def _session_umo(session) -> str:
+    """Build the unified message origin for a WebChat session's base
+    (non-thread) conversation -- the exact umo ``retrieve_knowledge_base``
+    resolves a session's ``kb_config`` against.
+
+    Mirrors ``astrbot.dashboard.services.chat_service.
+    build_webchat_unified_msg_origin`` exactly, but is duplicated locally
+    (not imported) so this module's own contract on what a ``session``
+    object must expose stays visible and minimal in one place, and so it
+    tolerates a session-like object that does not define ``is_group`` at
+    all (defaulting to ``0``, i.e. non-group -- ``PlatformSession.
+    is_group``'s own default) rather than depending on that helper's exact
+    attribute-access shape. Every real ``PlatformSession`` row always has
+    ``is_group``; this tolerance exists purely for lightweight test
+    doubles that intentionally expose only ``session_id``/``creator``/
+    ``platform_id`` (this module's only real, load-bearing attribute
+    contract on ``session`` before this function was added).
+    """
+    is_group = getattr(session, "is_group", 0)
+    message_type = (
+        MessageType.GROUP_MESSAGE.value if is_group else MessageType.FRIEND_MESSAGE.value
+    )
+    return (
+        f"{session.platform_id}:{message_type}:"
+        f"{session.platform_id}!{session.creator}!{session.session_id}"
+    )
+
+
+async def _ensure_explicit_kb_config(session) -> None:
+    """Backfill the default-open KB hole for a session created before
+    Phase 3 shipped this invariant.
+
+    Verified ground truth (``astrbot/core/tools/knowledge_base_tools.py:
+    24-87``): ``retrieve_knowledge_base`` only ever treats a session as
+    "bound to no knowledge base" when its ``kb_config`` is present *and*
+    carries an empty ``kb_ids`` list. A umo with no ``kb_config`` key at
+    all instead falls through to the operator's **global** ``kb_names``
+    config -- silently exposing whatever corpora the operator configured
+    there to every end user of every session that predates this code.
+
+    This function is called from :func:`_owned_session_row`, the single
+    ownership gate every session-scoped function in this module funnels
+    through -- critically including :func:`send_message` and
+    :func:`regenerate`, the *only* two facade entry points that can ever
+    cause an actual core chat turn (and therefore an actual
+    ``retrieve_knowledge_base`` call) to run for a portal session. Because
+    of that, this lazy backfill is not merely a stopgap: within the portal's
+    own threat model, the ONLY way a message ever reaches
+    ``retrieve_knowledge_base`` for a given session is via one of those two
+    functions, and both always call this first. So by the time any turn
+    could possibly read a stale/missing ``kb_config``, this has already
+    replaced it with an explicit empty one. There is no code path left by
+    which an untouched pre-Phase-3 session could leak the operator's global
+    KBs to an end user through the portal.
+
+    A *startup sweep* over every existing ``webchat`` ``PlatformSession``
+    row was considered instead (or in addition) and deliberately not
+    implemented here: ``BaseDatabase`` exposes no method to enumerate
+    platform sessions across every creator (only
+    ``get_platform_sessions_by_creator_paginated``, scoped to one user, and
+    ``get_platform_sessions_by_ids``, scoped to a known id list) -- adding
+    one would mean changing a core database module, which is out of this
+    phase's charter. Given the choke-point argument above, it would also be
+    redundant: a session nobody ever touches again through the portal can
+    never trigger a chat turn through the portal either, so there is
+    nothing left for a sweep to protect against that this backfill does
+    not already cover the moment it matters.
+
+    Idempotent and cheap once backfilled (one extra ``sp`` read, no write)
+    -- which is every session from this point forward, since
+    :func:`create_session` now writes this same explicit binding up front.
+    """
+    umo = _session_umo(session)
+    existing = await sp.session_get(umo, "kb_config", default=_MISSING_KB_CONFIG)
+    if existing is _MISSING_KB_CONFIG:
+        await sp.session_put(umo, "kb_config", _default_kb_config())
+        logger.info(
+            f"[portal] backfilled explicit empty kb_config for pre-existing "
+            f"session {session.session_id} (closing default-open KB fallback)"
+        )
+
+
 async def _owned_session_row(chat_service: ChatService, user_id: str, session_id: str):
     """Fetch a WebChat session row and verify ``user_id`` owns it.
 
@@ -316,6 +431,13 @@ async def _owned_session_row(chat_service: ChatService, user_id: str, session_id
     against the database row, *before* any ``ChatService`` method is
     invoked -- so callers of this module never depend on ``ChatService``'s
     own internal error message wording to stay secure.
+
+    Also the single choke point that backfills a missing ``kb_config``
+    (:func:`_ensure_explicit_kb_config`) for every session-scoped operation
+    in this module -- see that function's docstring and invariant 4 in the
+    module docstring for why funneling the backfill through here, rather
+    than through some separate startup job, is sufficient to close the
+    default-open KB hole.
     """
     session = await chat_service.db.get_platform_session_by_id(session_id)
     if (
@@ -324,6 +446,7 @@ async def _owned_session_row(chat_service: ChatService, user_id: str, session_id
         or session.platform_id != _WEBCHAT_PLATFORM_ID
     ):
         raise ResourceNotFoundError("Session not found")
+    await _ensure_explicit_kb_config(session)
     return session
 
 
@@ -337,12 +460,34 @@ async def create_session(user_id: str, request: Request) -> dict[str, Any]:
 
     The platform is always ``webchat`` -- callers cannot select a different
     platform through this facade.
+
+    Immediately writes an explicit ``{"kb_ids": [], "top_k": ...}``
+    ``kb_config`` for the new session's umo (module docstring, invariant
+    4) -- a brand-new session must never rely on the
+    :func:`_ensure_explicit_kb_config` backfill (that exists for sessions
+    that predate this invariant); it should simply never have a moment
+    where its ``kb_config`` is absent at all.
     """
     chat_service = _chat_service(request)
     try:
-        return await chat_service.new_session(user_id, _WEBCHAT_PLATFORM_ID)
+        result = await chat_service.new_session(user_id, _WEBCHAT_PLATFORM_ID)
     except ChatServiceError as exc:
         raise _translate_chat_service_error(exc) from exc
+
+    session = await chat_service.db.get_platform_session_by_id(result["session_id"])
+    if session is None:
+        # Core's own insert just returned successfully a moment ago; a miss
+        # here would mean core's own write path is broken, not something
+        # this module can meaningfully recover from.
+        logger.error(
+            f"[portal] session {result['session_id']} vanished immediately "
+            "after creation; kb_config was not written"
+        )
+        return result
+
+    umo = _session_umo(session)
+    await sp.session_put(umo, "kb_config", _default_kb_config())
+    return result
 
 
 async def list_sessions(user_id: str, request: Request) -> list[dict[str, Any]]:
@@ -820,7 +965,209 @@ async def get_chat_configs(user_id: str) -> dict[str, Any]:
     # symmetry with every other facade function and to leave room for a
     # future per-user override (e.g. once PortalAgentBundle ships in Phase 4)
     # without changing every call site.
-    return ChatConfigs().to_dict()
+    return ChatConfigs(
+        knowledge_base=get_portal_settings().kb_selection_enabled
+    ).to_dict()
+
+
+# ---------------------------------------------------------------------------
+# Knowledge-base session binding (Phase 3). See module docstring invariant 4
+# and ``kb_visibility_service.py`` (the portal-side authorization whitelist
+# gating which ``kb_id``s an end user may even choose from) for the full
+# picture. Everything below is deliberately "dumb": it verifies ownership
+# and moves data in/out of ``sp``/``kb_mgr`` with no whitelist/quota logic of
+# its own -- ``kb_visibility_service.bind_session`` is where every count/
+# top_k/visibility/existence check happens *before* it ever calls
+# :func:`set_session_kb_config`.
+# ---------------------------------------------------------------------------
+
+
+async def set_session_kb_config(
+    user_id: str,
+    request: Request,
+    session_id: str,
+    kb_ids: Sequence[str],
+    top_k: int,
+) -> dict[str, Any]:
+    """Overwrite an owned session's ``kb_config`` with ``kb_ids``/``top_k``.
+
+    Verifies ``user_id`` owns ``session_id`` (raising
+    :class:`ResourceNotFoundError` otherwise) and derives the umo to write
+    server-side from that same owned session row -- never from any
+    client-supplied umo/session field -- via :func:`_session_umo`.
+
+    Deliberately performs NO whitelist/count/range validation of ``kb_ids``/
+    ``top_k`` -- mirrors :func:`save_upload`'s "no MIME/size validation
+    happens here either" contract. ``kb_visibility_service.bind_session``
+    MUST run ``assert_all_visible`` (portal whitelist) and a live core
+    existence check, and clamp ``top_k`` to
+    ``PortalSettings.max_kb_top_k``/count to
+    ``PortalSettings.max_kb_ids_per_session``, *before* ever calling this
+    function. Calling this directly with unvalidated input would silently
+    reintroduce the exact default-open-adjacent risk this phase exists to
+    close (an unauthorized ``kb_id`` bound straight into a session's live
+    retrieval config).
+    """
+    chat_service = _chat_service(request)
+    session = await _owned_session_row(chat_service, user_id, session_id)
+    umo = _session_umo(session)
+    kb_config = {
+        "kb_ids": [str(kb_id) for kb_id in kb_ids],
+        "top_k": int(top_k),
+    }
+    await sp.session_put(umo, "kb_config", kb_config)
+    logger.info(
+        f"[portal] user {user_id} set kb_config for session {session_id}: "
+        f"{len(kb_config['kb_ids'])} kb(s), top_k={kb_config['top_k']}"
+    )
+    return kb_config
+
+
+async def get_session_kb_config(
+    user_id: str, request: Request, session_id: str
+) -> dict[str, Any]:
+    """Read back an owned session's ``kb_config`` as plain data.
+
+    Always returns a well-shaped ``{"kb_ids": [...], "top_k": ...}`` dict --
+    never ``None`` and never a malformed/partial value -- since
+    ``_owned_session_row`` (called here for the ownership check) already
+    backfills a missing key via :func:`_ensure_explicit_kb_config`. The
+    extra defensive re-shaping below guards only against a value that is
+    present but not the shape this module itself ever writes (e.g. hand-
+    edited via the operator's own ``SessionManagementService`` path, which
+    shares the same ``kb_config`` key -- see ``AVAILABLE_SESSION_RULE_KEYS``
+    ground truth).
+    """
+    chat_service = _chat_service(request)
+    session = await _owned_session_row(chat_service, user_id, session_id)
+    umo = _session_umo(session)
+    config = await sp.session_get(umo, "kb_config", default=None)
+    if not isinstance(config, dict):
+        return _default_kb_config()
+    kb_ids = config.get("kb_ids")
+    if not isinstance(kb_ids, list):
+        kb_ids = []
+    top_k = config.get("top_k", get_portal_settings().default_kb_top_k)
+    if not isinstance(top_k, int) or isinstance(top_k, bool):
+        top_k = get_portal_settings().default_kb_top_k
+    return {"kb_ids": [str(kb_id) for kb_id in kb_ids], "top_k": top_k}
+
+
+# ---------------------------------------------------------------------------
+# Live core KB resolution. Knowledge bases are global operator resources
+# with no owner column (verified ground truth,
+# astrbot/core/knowledge_base/models.py:24,31) -- there is no per-user
+# ownership check to perform here, only a plain-data snapshot of whatever
+# currently exists in core's in-memory ``KnowledgeBaseManager.kb_insts``.
+# ``kb_visibility_service.py`` is the ONLY expected caller of these two
+# functions: it is not permitted to import ``kb_mgr``/``core_lifecycle``
+# itself (only this file may reach core), so every "does this kb_id still
+# exist, and what does it currently look like" question it has must come
+# through here.
+# ---------------------------------------------------------------------------
+
+
+def _kb_manager(request: Request):
+    return request.app.state.core_lifecycle.kb_manager
+
+
+def _kb_helper_to_dict(kb_helper) -> dict[str, Any]:
+    kb = kb_helper.kb
+    return {
+        "kb_id": kb.kb_id,
+        "kb_name": kb.kb_name,
+        "description": kb.description,
+        "emoji": kb.emoji,
+        "doc_count": kb.doc_count,
+        "chunk_count": kb.chunk_count,
+        "available": kb_helper.init_error is None,
+    }
+
+
+async def get_kb_live_info(request: Request, kb_id: str) -> dict[str, Any] | None:
+    """A plain-data snapshot of one core KB, or ``None`` if ``kb_id`` does
+    not currently exist in core.
+
+    ``None`` here is exactly the "dangling" condition
+    ``kb_visibility_service`` must treat as "not selectable, not existing"
+    regardless of what this ``kb_id`` used to be -- see
+    ``PortalKbVisibility.kb_name``'s own docstring (db/models.py) for why a
+    whitelist row can outlive the KB it was granted for.
+    """
+    kb_mgr = _kb_manager(request)
+    kb_helper = await kb_mgr.get_kb(kb_id)
+    if kb_helper is None:
+        return None
+    return _kb_helper_to_dict(kb_helper)
+
+
+async def get_kb_live_info_batch(
+    request: Request, kb_ids: Sequence[str]
+) -> dict[str, dict[str, Any] | None]:
+    """Batch form of :func:`get_kb_live_info`: one dict entry per (unique)
+    id in ``kb_ids``, ``None`` for any that no longer exist in core.
+
+    Not a database query at all -- ``KnowledgeBaseManager.get_kb`` is a
+    plain in-memory dict lookup against ``kb_insts`` -- so "one query, not
+    N" is satisfied by construction rather than needing a dedicated batch
+    core API; this just avoids callers re-implementing the same loop.
+    """
+    kb_mgr = _kb_manager(request)
+    result: dict[str, dict[str, Any] | None] = {}
+    for kb_id in kb_ids:
+        kb_id = str(kb_id)
+        if kb_id in result:
+            continue
+        kb_helper = await kb_mgr.get_kb(kb_id)
+        result[kb_id] = None if kb_helper is None else _kb_helper_to_dict(kb_helper)
+    return result
+
+
+async def list_all_core_kbs(request: Request) -> list[dict[str, Any]]:
+    """Every knowledge base currently loaded in core, as plain data.
+
+    NOT exposed to any end-user-facing route -- this is the operator-only
+    "browse core's inventory to decide what to whitelist next" primitive
+    for the admin KB-visibility page, mirroring the existing (and already
+    operator-gated) ``astrbot/dashboard/api/knowledge_bases.py`` listing,
+    just funneled through the capability wall so
+    ``kb_visibility_service.py`` never needs its own ``kb_mgr`` import.
+    Callers (admin routes) MUST gate this behind ``require_system_scope``
+    themselves -- this function performs no authorization of its own, same
+    as every other core-inventory read in this module (see
+    :func:`get_chat_configs`'s neighboring comment on why the *portal*
+    dashboard's own ``ConfigProfileService`` listing is never reused here
+    for the equivalent end-user-facing case).
+    """
+    kb_mgr = _kb_manager(request)
+    kbs = await kb_mgr.list_kbs()
+    return [
+        {
+            "kb_id": kb.kb_id,
+            "kb_name": kb.kb_name,
+            "description": kb.description,
+            "emoji": kb.emoji,
+            "doc_count": kb.doc_count,
+            "chunk_count": kb.chunk_count,
+        }
+        for kb in kbs
+    ]
+
+
+async def write_default_kb_config_for_umo(umo: str) -> None:
+    """Write the explicit "no knowledge base" binding for a raw ``umo``.
+
+    Exists for the session-rule guard (``astrbot/portal/session_rule_guard.py``),
+    which is handed a umo string by core's session-rule route rather than an
+    owned session object, and which cannot reach ``sp`` itself -- only this
+    module may (capability wall, module docstring).
+
+    Deliberately writes an explicit empty ``kb_ids`` instead of removing the
+    key: ``retrieve_knowledge_base`` reads a *missing* ``kb_config`` as "use the
+    operator's global ``kb_names``", so removal would re-open the default-open
+    fallback rather than close it.
+    """
+    await sp.session_put(umo, "kb_config", _default_kb_config())
 
 
 __all__ = [
@@ -845,4 +1192,10 @@ __all__ = [
     "discard_orphaned_upload",
     "resolve_attachment",
     "get_chat_configs",
+    "set_session_kb_config",
+    "get_session_kb_config",
+    "get_kb_live_info",
+    "get_kb_live_info_batch",
+    "list_all_core_kbs",
+    "write_default_kb_config_for_umo",
 ]
