@@ -24,24 +24,33 @@ for this module:
    echoes, or forwards those two keys (see
    ``astr_main_agent.py:223-237``: ``_select_provider`` trusts them with no
    authorization check at all).
-2. **Text-only message bodies in Phase 1.** ``SendMessageRequest.message``
-   is typed as plain ``str``, not the ``str | list`` union
-   ``core_facade.send_message`` itself accepts, and
-   :func:`_ensure_text_only_content` rejects any non-``"plain"`` part in a
-   message-edit payload. Rationale: the core webchat message-parts pipeline
+2. **Multimodal message bodies require a verified owner (Phase 2).**
+   ``SendMessageRequest.message`` now accepts the ``str | list`` union
+   :func:`core_facade.send_message` itself accepts (the list form carries
+   media parts referencing an ``attachment_id``), and
+   :func:`_validate_message_parts_shape` performs the equivalent basic
+   shape check for a message-edit payload. Rationale for why this used to
+   be text-only and now is not: the core webchat message-parts pipeline
    (``astrbot.core.platform.sources.webchat.message_parts_helper
    .build_webchat_message_parts``) resolves any non-``plain``/``reply``
    part purely by ``attachment_id`` via ``get_attachment_by_id`` -- and
    ``Attachment`` has no owner column at all (verified ground truth: see
-   ``astrbot/core/db/po.py:340-361``). Phase 1 ships no upload endpoint
-   (that is explicitly Phase 2 work), so the *only* way a list-shaped or
-   attachment-referencing payload could reach that code path in this phase
-   is through these two routes. Accepting it here would let any
-   authenticated portal user embed and have rendered an attachment_id
-   belonging to a *different* user/dashboard admin -- a cross-tenant IDOR
-   with no ownership check anywhere in the chain. Rejecting non-text
-   payloads at the route boundary closes that off entirely until Phase 2
-   adds real per-user attachment ownership.
+   ``astrbot/core/db/po.py:340-361``). Phase 1 shipped no upload endpoint
+   and no ownership table, so accepting a list-shaped payload then would
+   have let any authenticated portal user embed and have rendered an
+   attachment_id belonging to a *different* user -- a cross-tenant IDOR
+   with no ownership check anywhere in the chain. Phase 2 closes that gap
+   with the ``PortalAttachmentOwner`` shadow-ownership table (db/models.py)
+   plus ``attachment_service.assert_owns_all``, its batch-ownership check:
+   every route below
+   that can carry a media part now passes
+   ``attachment_service.assert_owns_all`` as ``core_facade.send_message``/
+   ``update_message``'s ``verify_attachment_ownership`` argument, which
+   ``core_facade`` calls with every distinct ``attachment_id`` in the
+   sanitized parts *before* ``ChatService`` is ever invoked; a miss (row
+   absent, or owned by someone else) raises
+   ``core_facade.ResourceNotFoundError`` -> HTTP 404 for the *whole*
+   request, never a partial/best-effort accept.
 
 Per-user concurrent-run limiting (the "CONTRACT for chat_routes.py" in
 ``auth/rate_limit.py``'s module docstring) is implemented in
@@ -65,7 +74,7 @@ from typing import Any, NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
@@ -78,7 +87,7 @@ from astrbot.portal.auth.rate_limit import (
 from astrbot.portal.config import get_portal_settings
 from astrbot.portal.db.engine import portal_async_sessionmaker
 from astrbot.portal.db.models import PortalUsageCounter, PortalUser
-from astrbot.portal.services import core_facade
+from astrbot.portal.services import attachment_service, core_facade
 from astrbot.portal.services.core_facade import (
     CoreFacadeError,
     ResourceNotFoundError,
@@ -123,14 +132,78 @@ class BatchDeleteRequest(BaseModel):
     session_ids: list[str] = Field(min_length=1, max_length=200)
 
 
-class SendMessageRequest(BaseModel):
-    """See module docstring, invariant 2, for why ``message`` is ``str``
-    only rather than ``core_facade.send_message``'s full ``str | list``."""
+class MessagePart(BaseModel):
+    """One element of the Phase 2 multimodal ``message`` list form.
+
+    This model's job is basic shape/type validation ONLY -- it is
+    deliberately NOT the security boundary. ``core_facade
+    ._sanitize_message_parts`` is the authoritative whitelist filter
+    (down to exactly ``{type, attachment_id, filename, text, message_id,
+    selected_text}``) applied again, unconditionally, just before anything
+    reaches ``ChatService`` -- so a client-supplied ``path`` or
+    ``stored_filename`` key validates fine here (``extra="ignore"`` simply
+    drops it) but can never survive past ``core_facade`` regardless of
+    what this model does or does not strip. Ownership of any
+    ``attachment_id`` present is verified downstream by
+    ``attachment_service.assert_owns_all``, injected as ``core_facade
+    .send_message``'s ``verify_attachment_ownership`` argument -- never
+    here.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
-    message: str = Field(min_length=1)
+    type: str
+    text: str | None = None
+    attachment_id: str | None = None
+    filename: str | None = None
+    message_id: int | None = None
+    selected_text: str | None = None
+
+
+class SendMessageRequest(BaseModel):
+    """``message`` accepts either plain text or the Phase 2 multimodal list
+    form -- see module docstring, invariant 2, for the ownership-
+    verification contract every list-shaped payload goes through before it
+    ever reaches ``core_facade.send_message``."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    message: str | list[MessagePart]
     flags: dict[str, bool] | None = None
+
+    @field_validator("message")
+    @classmethod
+    def _validate_message(
+        cls, value: str | list[MessagePart]
+    ) -> str | list[MessagePart]:
+        if isinstance(value, str):
+            if not value.strip():
+                raise ValueError("message must not be blank")
+            return value
+        if not value:
+            raise ValueError("message list must not be empty")
+        return value
+
+
+def _message_parts_payload(
+    message: str | list[MessagePart],
+) -> str | list[dict[str, Any]]:
+    """Convert the validated request model's ``message`` into the plain
+    ``str | list[dict]`` shape ``core_facade.send_message`` expects.
+
+    This conversion matters, not just for convenience: ``core_facade
+    ._sanitize_message_parts`` does ``isinstance(part, dict)`` and silently
+    *drops* anything that is not a plain dict, so handing it a list of
+    ``MessagePart`` model instances directly would make every media part
+    vanish rather than raise -- a silent request-corruption bug, not a
+    visible error. ``exclude_none=True`` keeps the dict shape close to what
+    a client actually sent (no ``attachment_id: null`` on a plain-text
+    part), which is harmless either way since ``core_facade`` only reads
+    keys that are actually present.
+    """
+    if isinstance(message, str):
+        return message
+    return [part.model_dump(exclude_none=True) for part in message]
 
 
 class MessageEditRequest(BaseModel):
@@ -139,15 +212,30 @@ class MessageEditRequest(BaseModel):
     content: dict[str, Any]
 
 
-def _ensure_text_only_content(content: dict[str, Any]) -> None:
-    """Reject a message-edit payload containing any non-``"plain"`` part.
+# Same vocabulary core's own webchat message-parts pipeline recognizes
+# (``message_parts_helper.MEDIA_PART_TYPES`` plus ``plain``/``reply``) --
+# duplicated here (not imported) for the same reason ``core_facade.py``
+# duplicates its own copy of this set: importing a helper from that core
+# submodule just to get one constant is not worth a new capability-wall
+# surface, and this vocabulary has been stable since Phase 1.
+_ALLOWED_EDIT_PART_TYPES = frozenset(
+    {"plain", "reply", "image", "record", "file", "video"}
+)
 
-    See module docstring, invariant 2. ``ChatService.update_message``'s own
+
+def _validate_message_parts_shape(content: dict[str, Any]) -> None:
+    """Basic shape/type validation for a message-edit payload's
+    ``content.message`` list -- NOT the ownership check.
+
+    See module docstring, invariant 2: ``ChatService.update_message``'s own
     ``sanitize_message_content`` only checks that ``content.message`` is a
     list and strips ``path`` fields -- it does **not** re-resolve each
     part's ``attachment_id`` against ``get_attachment_by_id`` the way the
     send-message path does, so it provides no ownership check at all for
-    whatever shape the client hands it.
+    whatever shape the client hands it. That check happens downstream,
+    in ``core_facade.update_message``, via the ``attachment_service
+    .assert_owns_all`` verifier the caller below injects -- this function
+    only rejects payloads whose *shape* is not even worth forwarding.
     """
     parts = content.get("message")
     if not isinstance(parts, list) or not parts:
@@ -155,10 +243,12 @@ def _ensure_text_only_content(content: dict[str, Any]) -> None:
             status_code=400, detail="content.message must be a non-empty list"
         )
     for part in parts:
-        if not isinstance(part, dict) or part.get("type") != "plain":
+        if not isinstance(part, dict) or part.get("type") not in (
+            _ALLOWED_EDIT_PART_TYPES
+        ):
             raise HTTPException(
                 status_code=400,
-                detail="Only plain-text message parts are supported in this phase",
+                detail="Unsupported or missing message part type",
             )
 
 
@@ -439,7 +529,12 @@ async def send_chat_message(
     window_start = await _acquire_run_slot(user_id)
     try:
         stream = await core_facade.send_message(
-            user_id, request, session_id, payload.message, flags=payload.flags
+            user_id,
+            request,
+            session_id,
+            _message_parts_payload(payload.message),
+            flags=payload.flags,
+            verify_attachment_ownership=attachment_service.assert_owns_all,
         )
     except CoreFacadeError as exc:
         await _release_run_slot(user_id, window_start)
@@ -502,10 +597,15 @@ async def edit_chat_message(
         raise HTTPException(
             status_code=400, detail="Only user messages can be edited"
         )
-    _ensure_text_only_content(payload.content)
+    _validate_message_parts_shape(payload.content)
     try:
         return await core_facade.update_message(
-            current_user.user_id, request, session_id, message_id, payload.content
+            current_user.user_id,
+            request,
+            session_id,
+            message_id,
+            payload.content,
+            verify_attachment_ownership=attachment_service.assert_owns_all,
         )
     except CoreFacadeError as exc:
         _raise_for_core_error(exc)
