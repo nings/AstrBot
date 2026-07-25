@@ -22,6 +22,12 @@
       <template v-else>
         <div class="chat-header">
           <span class="chat-title">{{ activeSessionTitle || "新会话" }}</span>
+          <KbSelector
+            :key="activeSessionId"
+            class="chat-header-kb-selector"
+            :session-id="activeSessionId ?? ''"
+            :disabled="isGenerating"
+          />
         </div>
 
         <div v-if="resumeNotice" class="banner banner-warning">
@@ -332,6 +338,7 @@ import { copyToClipboard } from "@/utils/clipboard";
 import PortalSessionList from "@/components/portal/PortalSessionList.vue";
 import PortalComposer from "@/components/portal/PortalComposer.vue";
 import PortalAttachment from "@/components/portal/PortalAttachment.vue";
+import KbSelector from "@/components/portal/KbSelector.vue";
 
 registerPortalChatMarkdownComponents();
 
@@ -1242,13 +1249,25 @@ async function regenerateLast() {
 
 .chat-header {
   flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   padding: 14px 20px;
   border-bottom: 1px solid var(--chat-border);
 }
 
 .chat-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 15px;
   font-weight: 600;
+}
+
+.chat-header-kb-selector {
+  flex-shrink: 0;
 }
 
 .chat-scroll {

@@ -90,6 +90,11 @@ const MainRoutes = {
       component: () => import('@/views/SubAgentPage.vue')
     },
     {
+      name: 'PortalKbVisibilityAdmin',
+      path: '/portal-kb-visibility',
+      component: () => import('@/components/admin/PortalKbVisibilityAdminPage.vue')
+    },
+    {
       name: 'CronJobs',
       path: '/cron',
       component: () => import('@/views/CronJobPage.vue')
