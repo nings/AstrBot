@@ -451,3 +451,5 @@ sequenceDiagram
 9. **`self_registration_open` 默认仍为 `True`** —— 实现者认为开户/SSO 就绪后应改为 `False` 更正确，但改动会破坏两个既有测试，选择上报而非硬改。
 10. **缺"已绑定 SSO 身份"的账号设置页** —— 后端 link/unlink 端点已就绪，但终端用户没有入口自助发起绑定。
 11. **thread 维度 umo 未覆盖 KB 默认关闭修复** —— 目前无 portal 路由能创建/进入 thread，故不可利用；一旦放开即为盲点。
+12. **没有配置入口（最高优先级待办）** —— `get_portal_settings()` 返回硬编码的 `DEFAULT_PORTAL_SETTINGS`，不读环境变量、不读 `cmd_config.json`、无管理界面、无任何 mutate 路径。Phase 1 的 docstring 写着"a later phase can source overrides"，但后续四个阶段都没做。**直接后果：Phase 5 的三个 SSO provider 完整实现且 51 个测试通过，却在真实部署里无法启用**（`sso_enabled=False`、`sso_enabled_providers` 为空、三组凭证均 `None`）；配额、上限、`self_registration_open` 也全部锁死。目前唯一办法是改 `astrbot/portal/config.py` 并重启。补配置机制需要先决定 overrides 落在哪（env / `cmd_config.json` / 新建管理表），是一个独立的小设计。
+13. **OpenAPI spec 未包含 portal 端点** —— `openspec/openapi-v1.yaml` 是**手写维护**的（6224 行 / 223 条路径），缺全部 50 个 portal 端点（其中 16 个在 `admin_routes`）。这是**有意不补**：该 spec 驱动 `npm run generate:api` 生成的 axios client 与 `docs/public/openapi.json`，而 portal 前端不用生成的 client（它有自己的 `src/api/portal.ts`），portal API 也没有第三方消费者。手写 50 个端点的 YAML 成本高、易与代码漂移、收益低。**若日后要对外开放 portal API 供第三方调用，这一条就必须补上。**

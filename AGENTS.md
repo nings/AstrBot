@@ -19,6 +19,42 @@ pnpm dev
 
 Runs on `http://localhost:3000` by default.
 
+### Portal (end-user chat frontend)
+
+`dashboard/` builds **two** bundles from one source tree. The WebUI above is the
+operator console; Portal is the multi-user frontend for end users, served at
+`/portal`.
+
+```
+cd dashboard
+npm run dev:portal      # hot reload
+npm run build:portal    # -> dashboard/dist-portal/
+npm run lint:portal     # enforced import boundary, --max-warnings 0
+```
+
+Both bundles must build before a release; the packaging in
+`scripts/hatch_build.py` and the release/docker workflows handle each separately.
+
+Working on `astrbot/portal/**` has three rules that CI enforces:
+
+1. **Capability wall.** Only `services/core_facade.py` may import
+   `chat_service` / `conversation_mgr` / `shared_preferences` / `persona_mgr`;
+   nothing may import `ConversationService` / `SessionManagementService` /
+   `ApiKeyService` / `SubAgentOrchestrator`. Run `uv run lint-imports`.
+2. **Core stays portal-agnostic.** `astrbot/core/**` and
+   `astrbot/dashboard/**` may import `astrbot.portal` in exactly two places:
+   `dashboard/api/app.py` (lifespan wiring) and `dashboard/api/router.py` (the
+   mount). Anything else is a regression — extend the
+   `SessionRuleGuard` registration hook in
+   `dashboard/services/session_management_service.py` instead.
+3. **Frontend import boundary.** `dashboard/src/components/portal/**` may not
+   reach operator-only components (`ProviderModelMenu.vue`, `ConfigSelector.vue`,
+   `Chat.vue`, …); ESLint blocks it.
+
+Design rationale, the security checklist, and the record of what diverged during
+implementation live in [`design/portal-multiuser-plan.md`](design/portal-multiuser-plan.md).
+User-facing docs: [`docs/en/use/portal.md`](docs/en/use/portal.md).
+
 ## Pre-commit setup
 
 AstrBot uses [pre-commit](https://pre-commit.com/) hooks to automatically format and lint Python code before each commit. The hooks run `ruff check`, `ruff format`, and `pyupgrade` (see [`.pre-commit-config.yaml`](.pre-commit-config.yaml) for details).
