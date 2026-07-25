@@ -1,7 +1,9 @@
 # AstrBot 多用户 C 端聊天前端 —— 最终架构决策与实施路线图
 
-版本：v1.0（终审定案） 作者：首席架构师（综合 P1/P2/P3 三方案 + 三评审视角）
-状态：待评审通过后进入 Phase 1 开发
+版本：v1.1 作者：首席架构师（综合 P1/P2/P3 三方案 + 三评审视角）
+状态：**Phase 1-5 已全部实现**。上文第 1-8 节保留为定案时的原始设计基线；实现过程中的偏差、以及尚未达成的项，一律记录在**第 9 节**，不回改上文。
+
+> **读本文档前请先读第 9 节。** 上文若与代码冲突，以代码 + 第 9 节为准。特别注意第 4 节第 13 条（AGPL §13 源码端点）**尚未实现**，对外提供网络服务前是硬性前置。
 
 ---
 
@@ -118,8 +120,9 @@ astrbot/portal/services/core_facade.py   # 全模块唯一允许 import 以下�
 |---|---|---|
 | `PortalUser` | user_id(uuid pk), email, password_hash, display_name, auth_method, role, status, created_at | 根身份表 |
 | `PortalSession` | session_id, user_id fk, refresh_token_hash, family_id, expires_at, revoked_at | 可撤销、可重放检测的 refresh token 存储 |
-| `PortalOAuthIdentity` | user_id fk, provider, provider_subject | Phase 5b 占位，Phase1 建表不启用 |
-| `PortalPasswordResetToken` / `PortalEmailVerificationToken` | — | 账号生命周期标准件 |
+| `PortalOAuthIdentity` | user_id fk, provider, provider_subject | Phase 5 SSO 身份绑定（Phase 1 建空表，Phase 5 启用） |
+| `PortalInvite` | invite_id, token_hash, target_email, expires_at, consumed_at, revoked_at, created_by | Phase 5 管理员开户的一次性邀请。**未在本表最初的规划内**，是 Phase 5 实现时新增的 |
+| ~~`PortalPasswordResetToken` / `PortalEmailVerificationToken`~~ | — | **未实现，且短期内不应实现**：两者都以"能发邮件"为前提，而本仓库没有任何邮件设施（无 smtplib/aiosmtplib 使用）。后果是**目前没有密码重置流程**——用户忘记密码只能由运维方通过 `/admin` 重新签发邀请。要真正补上这一环，前置条件是先引入邮件发送能力，那是独立立项 |
 | `PortalAttachmentOwner` | attachment_id（字符串关联核心 Attachment.attachment_id，非 FK）, user_id fk | 核心 Attachment 表无 owner 列的唯一补救 |
 | `PortalKbVisibility` | kb_id, enabled_for_enduser | 管理员维护的 KB 白名单 |
 | `PortalAgentBundle` | bundle_id, display_name, persona_id, provider_id, kb_ids(json) | MVP 对需求(d)的回答：策展好的 persona+provider+KB 组合，而非裸露子代理 |
@@ -205,7 +208,13 @@ sequenceDiagram
 3. **每一个会话/线程/项目相关 endpoint**，处理函数签名中绝不允许出现客户端可控的 `owner`/`username`/`user_id` 字段——一律从已验证的 JWT `sub` claim 派生。CI 增加一条 grep-based lint：路由文件里出现 `request.json()['user_id']`/`Body(..., alias='username')` 这类模式即告警。
 4. **附件所有权**：`GET /api/v1/portal/files/{id}` 必须先查 `PortalAttachmentOwner`，未命中或不属于 caller 一律 404（不是 403，避免枚举）。核心 `GET /api/v1/files/{id}` 永不暴露给 portal 前端(前端生成的 API client 不应包含对 `/api/v1/files/` 的任何引用，CI 断言)。
 5. **Token 隔离**：`astrbot_portal_jwt`/`astrbot_portal_refresh` 与 `astrbot_dashboard_jwt` 使用不同签名密钥、不同 claim 形状（`sub=uuid` vs `username=str`）、不同 cookie 名与 Path。集成测试：用 portal JWT 打向任意核心 `/api/v1/{conversations,sessions,config}` 端点，断言 401；反向亦然。
-6. **网络/路径隔离**：反向代理配置中，`/api/v1/conversations*`、`/api/v1/sessions*`、`/api/v1/session-groups*`、`/api/v1/config*`、`/api/v1/api-keys*`、`/api/v1/plugins*`、`/api/v1/persona*`、`/api/v1/subagents*` 仅允许来自内网/VPN CIDR 的请求。部署清单必须包含此反向代理规则的自动化测试（例如从公网出口探测这些路径应返回连接拒绝/403，而非 200）。
+6. **网络/路径隔离**：反向代理配置中，以下路径仅允许来自内网/VPN CIDR 的请求：
+   - 核心运营面：`/api/v1/conversations*`、`/api/v1/sessions*`、`/api/v1/session-groups*`、`/api/v1/config*`、`/api/v1/api-keys*`、`/api/v1/plugins*`、`/api/v1/persona*`、`/api/v1/subagents*`
+   - **`/api/v1/portal/admin/*`** —— portal 自己的运营 CRUD（KB 可见性、Agent Bundle、用户开户与邀请）。**这一条是 Phase 3 引入、Phase 4/5 扩大的，本条清单最初漏写。** 它落在 `/api/v1/portal/*` 前缀下，而该前缀整体是需要公网可达的（终端用户就在这里），所以"把 `/api/v1/portal/*` 开放给公网"这句话必须带上这个例外，否则运维方照做就会把开户、邀请签发、语料授权全部暴露到公网，只剩 `require_system_scope` 一道防线。
+
+   公网只应可达：`/api/v1/portal/*` **减去** `/api/v1/portal/admin/*`，以及 `/portal/*`（SPA 静态资源）。
+
+   部署清单必须包含此反向代理规则的自动化测试（例如从公网出口探测这些路径应返回连接拒绝/403，而非 200），且该测试必须显式覆盖 `/api/v1/portal/admin/*`——它与相邻的终端用户路径只差一个路径段，是最容易被规则写漏的一条。
 7. **Refresh token 轮换 + 重放检测**：`PortalSession` 记录 `family_id`；一旦检测到已消费 token 被再次提交，立即吊销整条 family 并强制重新登录。测试：模拟 replay attack，断言吊销生效。
 8. **KB/Agent Bundle 选择白名单**：`POST .../sessions/{id}/knowledge-base` 与 `.../agent-bundle` 必须校验 `kb_id`/`bundle_id` 在管理员维护的 `PortalKbVisibility`/`PortalAgentBundle` 表中，umo 由已完成所有权校验的 session 服务端派生，绝不接受客户端传入的 umo 字符串（对应 recon 明确警告 `SharedPreferences` 本身零鉴权）。
 9. **umo 路由健康检查（移植自 P3）**：模块 `initialize()` 阶段调用 `umop_config_router` 查询，验证 portal 流量的 umo 前缀（如 `webchat:FriendMessage:webchat!*`）是否路由到一个 `subagent_orchestrator.main_enable=false` 且未挂载危险工具（文件写入/shell/无限制 web-fetch）的专用 config profile；未通过则在启动日志打印 CRITICAL 并可配置为拒绝启动。
@@ -213,6 +222,12 @@ sequenceDiagram
 11. **SSRF/Prompt Injection 边界**：上传接口只接受本地 multipart 字节，绝不服务端代发起 URL 抓取；`PortalAgentBundle` 中的 persona/provider 必须由管理员显式审核后加入白名单，公开可选集合默认不包含具备无限制网络访问/文件系统写入能力的工具。
 12. **前端 import 边界**：ESLint `no-restricted-imports` 规则覆盖 `dashboard/src/components/portal/**`，CI 阻断任何引入运营端专属组件的 PR。
 13. **AGPL §13 源码指针**：`GET /api/v1/portal/source` 公开无需登录，返回当前运行的 AstrBot commit SHA + portal 模块 commit SHA + 对应源码链接，构建时通过 `SOURCE_COMMIT` build arg 注入,前端登录页/页脚常驻可见（即使未登录）。
+
+    > **⚠️ 本条未达成（Phase 1-5 结束时的实际状态）。** `GET /api/v1/portal/source` 这个端点**不存在**——全仓 grep 无任何实现。前端登录页确实有"查看源代码"链接与 AGPL 说明文案，但它指向上游仓库，而不是本次实际运行的 commit。
+    >
+    > 这是本清单中唯一未达成的条目，且它不是代码质量问题而是**合规问题**：AGPL §13 要求向通过网络使用本服务的人提供**其所实际运行的那份**源码。指向上游 `AstrBotDevs/AstrBot` 不满足这个要求，因为运行的是本分支（含 33k 行新增代码）。
+    >
+    > 上线前必须补齐：一个公开的 `/api/v1/portal/source` 端点 + 构建期注入 commit SHA + 前端链接指向该端点。如果本分支永不对外提供网络服务（仅内部试验），则此条不适用——但一旦有外部用户访问，它就是硬性前置。
 
 ---
 
@@ -393,4 +408,46 @@ sequenceDiagram
 
 ## 8. 文档使用说明
 
-本文件是唯一权威设计基线。任何实现阶段发现与本文件冲突的技术细节（如某核心方法签名与 recon 记录不符），应先更新本文件对应章节并说明理由，再变更代码。第 5 节的 `files_touched` 清单中标注 **MODIFIED** 的核心文件（仅 `astrbot/dashboard/api/router.py`、`astrbot/dashboard/api/app.py`，以及 Phase4.5 可选的 `astrbot/core/astr_main_agent.py`）在每次 AstrBot 版本升级后必须重新走查 diff 是否仍然适用，此为常规升级 checklist 的强制项。
+本文件第 1-8 节是定案时的设计基线；实现偏差记录在第 9 节（见文首提示）。任何后续变更若与本文件冲突，应先更新对应章节或在第 9 节补记并说明理由，再变更代码。
+
+**AstrBot 版本升级 checklist（强制项）。** 以下核心文件被本项目改动过，每次升级后必须重新走查 diff 是否仍然适用：
+
+1. `astrbot/dashboard/api/router.py` —— 一行 `include_router(portal_router)`。
+2. `astrbot/dashboard/api/app.py` —— lifespan 中的 portal 初始化（建表、JWT secret、session-rule guard 注册、umo 路由健康检查），以及 portal 静态路由**必须**注册在 catch-all `static_files_router` 之前这一顺序约束。
+3. `astrbot/dashboard/services/session_management_service.py` —— **本文件最初未预见的第 3 处核心改动**，Phase 3 安全审计迫出：新增 `SessionRuleGuard` 协议与 `register_session_rule_guard` 注册点。它本身与 portal 无关（核心不 import portal），但 portal 依赖它存在。升级时若上游重构了 `AVAILABLE_SESSION_RULE_KEYS` 或那三个 delete/update 方法，必须确认 guard 调用点仍在原位——**否则 `kb_config`/`session_service_config`/`provider_perf_chat_completion` 的白名单绕过会静默复活**。
+4. `astrbot/core/astr_main_agent.py` —— Phase 4.5 可选项，**当前未改动**。若日后启用，加入本清单。
+
+另外两项非核心但同样属于升级面：`pyproject.toml` 的 import-linter 契约（能力墙靠它强制），以及 `scripts/hatch_build.py` / `.github/workflows/{release,docker-image}.yml` 中对 `dist-portal` 的打包处理（漏掉即前端 404）。
+
+**依赖面**：本项目**未新增任何运行时依赖**。OIDC 建在 `pyjwt`+`httpx` 上，企微/飞书建在已有的 `wechatpy`/`lark-oapi` 上。升级这四个包时需复查 `astrbot/portal/services/sso/` 是否仍成立——尤其 `jwt.PyJWKClient` 的行为与 `wechatpy.enterprise` 的模块路径（注意 `wechatpy.work` 在 1.8.x 不存在）。
+
+---
+
+## 9. 实现偏差记录（Phase 1-5 全部完成后回填）
+
+本节记录**实现与本文件规划不一致之处**，以及**已知未达成项**。写在这里而不是悄悄改掉上文，是为了让"当初怎么想的"和"最后怎么做的"都可追溯。
+
+### 9.1 与规划不同的技术决策（均为有意，附理由）
+
+| 项 | 本文原规划 | 实际实现 | 理由 |
+|---|---|---|---|
+| 授权失败状态码 | 第 5 节 Phase 3 验收标准 1 写 **403** | 统一 **404** | 保持模块既有约定，避免把响应变成"该资源是否存在"的预言机。KB 是运营资源而非用户资产，两种读法都成立，选了不泄露存在性的那个。全部 KB/Bundle 路由一致 |
+| OIDC 客户端 | 第 5 节 Phase 5 写「authlib 集成」 | **pyjwt + httpx，零新增依赖** | `pyjwt` 自带 `PyJWKClient`（JWKS 拉取 + 签名校验），`httpx` 做 token 交换，两者已是依赖。对抗审计逐行审过自研实现后判定 `keep-self-built`、未发现缺陷，故不引入 authlib。若日后审计结论改变，换回 authlib 的边界很清晰：仅 `services/sso/oidc.py` |
+| 企微/飞书 SDK | 未指定 | `wechatpy.enterprise` + `lark_oapi.api.authen`，同样零新增依赖 | 两者已因 IM 平台适配器成为依赖。注意：**登录用的应用凭证与 IM 适配器的 bot 凭证是两套**，不得混用 |
+| 核心侵入范围 | 预算 2 处（+Phase4.5 可选 1 处） | **3 个文件**：`api/router.py`（挂载）、`api/app.py`（lifespan）、`services/session_management_service.py`（新增 guard 注册钩子） | 第 3 个是 Phase 3 安全审计迫出来的：`POST /api/v1/sessions/rules` 仅需 `require_data_scope` 却能写 `kb_config`/`session_service_config`/`provider_perf_chat_completion`，完全绕过 portal 的白名单。核心因此新增一个**与 portal 无关**的 `SessionRuleGuard` 注册点，由 portal 在启动时填充——核心仍不 import portal（除上述两处挂载点），无 portal 部署时行为与改动前逐字节一致 |
+| SSO 与账号的关系 | 未明确 | **SSO 只是已有账号的登录方式，不是注册通道** | 未绑定的身份直接拒绝。身份只按 `(provider, subject)` 解析、从不按 email，且无任何路径能从 SSO 回调创建 `PortalUser`。这从结构上消灭了"让 IdP 声称受害者邮箱以取得/抢占其账号"整类攻击，强于任何开关。**若产品预期是"企微扫码即用、无需预先开户"，这是一个需要改的产品决策** |
+| Phase 4.5 子代理白名单 | 已列为可选、默认关闭、延后 | **未做** | `SubAgentOrchestrator` 是全局单例、无 per-umo 授权挂点，真正隔离必须改核心。MVP 用 persona+provider+KB 套餐满足需求(d) |
+
+### 9.2 已知未达成 / 受限项
+
+1. **AGPL §13 源码端点未实现** —— 见第 4 节第 13 条的告警框。这是唯一未达成的安全清单条目，且对外提供服务前是硬性前置。
+2. **没有密码重置流程** —— 依赖邮件能力，而本仓库无邮件设施。见 3.3 表格。用户忘密码只能由运维方重新签发邀请。
+3. **单进程约束（`replicas: 1`）** —— 三处进程内状态：核心 `ChatService.chat_runs`（Phase 1 继承）、限流器计数、SSO 的 state/nonce/PKCE 与 link 确认票据（Phase 5）。水平扩展需要先把这些搬到共享存储。
+4. **umo 路由健康检查只能告警** —— 第 4 节第 9 条要求的检查已实现并每次启动打日志，但 `refuse_to_start` 默认关闭且**没有运维可配置的开关**，所以未正确配置隔离 profile 的部署会永远打 CRITICAL 然后照常服务。
+5. **无真机端到端验证** —— 以下四条验收标准只有集成层面证据，没有跑起完整栈的真机证据：图片多模态回复（Phase 2 标准 4）、KB 检索命中（Phase 3 标准 2）、Bundle 切换体现新 persona/provider（Phase 4 标准 1）、真实 IdP 往返（Phase 5）。
+6. **非图片类型的 MIME 仅声明级校验** —— 核心只嗅探图片；portal 额外为 PDF（magic bytes）和 JSON（可解析）做了内容校验，audio/video/text 仍只信客户端声明的 Content-Type。
+7. **persona 重置是快照而非活指针** —— 核心 `update_conversation` 无法把 `persona_id` 写回 NULL，故解绑时写入"当前运营默认 persona"的快照；运营方后来改默认值，已解绑会话不跟随。
+8. **`session_service_config` 的通用规则编辑器对 portal 会话不可用** —— guard 协议只拿到 `(umo, rule_key)` 拿不到 value，无法"仅在写 persona_id 时拒绝"。运营方仍可通过 `batch_update_service` 改 `llm_enabled`/`tts_enabled`。
+9. **`self_registration_open` 默认仍为 `True`** —— 实现者认为开户/SSO 就绪后应改为 `False` 更正确，但改动会破坏两个既有测试，选择上报而非硬改。
+10. **缺"已绑定 SSO 身份"的账号设置页** —— 后端 link/unlink 端点已就绪，但终端用户没有入口自助发起绑定。
+11. **thread 维度 umo 未覆盖 KB 默认关闭修复** —— 目前无 portal 路由能创建/进入 thread，故不可利用；一旦放开即为盲点。
