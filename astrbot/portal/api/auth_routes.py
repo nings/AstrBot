@@ -12,22 +12,53 @@ paths are:
     POST /api/v1/portal/auth/logout
     GET  /api/v1/portal/auth/me
 
+Phase 5 adds two more identity paths on top of the five above, both built
+entirely on the primitives already established here (cookies, CSRF,
+throttling) rather than a second token path:
+
+    GET  /api/v1/portal/auth/sso/providers               (public)
+    GET  /api/v1/portal/auth/sso/{provider}/start         (public, 302 to IdP)
+    GET  /api/v1/portal/auth/sso/{provider}/callback      (public)
+    POST /api/v1/portal/auth/sso/{provider}/link          (authenticated + CSRF)
+    POST /api/v1/portal/auth/sso/{provider}/link/confirm  (authenticated + CSRF)
+    POST /api/v1/portal/auth/sso/{provider}/unlink        (authenticated + CSRF)
+    GET  /api/v1/portal/auth/sso/linked                   (authenticated)
+    POST /api/v1/portal/auth/invite/redeem                (public, rate-limited)
+
+All SSO business logic (state/nonce/PKCE, provider adapters, account-
+linking/takeover guards) lives in ``astrbot.portal.services.sso_service`` --
+this file only ever wires HTTP request/response shapes (query params,
+cookies, JSON bodies, status codes) to that module's functions and to
+``astrbot.portal.services.invite_service`` for invite redemption. Neither
+service module is owned by this assignment; their exception vocabularies
+and recommended HTTP mappings are treated as the single source of truth
+(see each module's own docstring) and mirrored here, not re-derived.
+
 This file only ever talks to the portal module's own database
 (``astrbot.portal.db.engine.get_portal_db_session``) via
-``astrbot.portal.services.session_service`` -- it never imports
-``astrbot.dashboard.*`` or any capability-wall-forbidden core service (rule
-5): it is not the capability wall (``core_facade.py``), and none of these
-endpoints need to reach ``ChatService``/``conversation_mgr``/etc. at all.
+``astrbot.portal.services.session_service``/``sso_service``/``invite_service``
+-- it never imports ``astrbot.dashboard.*`` or any capability-wall-forbidden
+core service (rule 5): it is not the capability wall (``core_facade.py``),
+and none of these endpoints need to reach ``ChatService``/
+``conversation_mgr``/etc. at all.
 
 Identity is always derived from the verified ``astrbot_portal_jwt`` cookie
 (see ``astrbot.portal.auth.dependencies.get_current_user``) -- never from any
-client-supplied field, per rule 4.
+client-supplied field, per rule 4. For the SSO link/confirm/unlink routes
+below, this means ``user_id`` is always ``get_current_user``'s resolved
+``PortalUser.user_id``, never anything read from the request body -- the
+whole unforgeability property ``sso_service.confirm_link`` relies on
+(binding a link confirmation to "the same account that started the flow")
+depends on that being true.
 """
 
 from __future__ import annotations
 
+from typing import NoReturn
+from urllib.parse import urlsplit
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from astrbot import logger
@@ -38,10 +69,11 @@ from astrbot.portal.auth.security import (
     generate_csrf_token,
     verify_access_token,
 )
-from astrbot.portal.config import get_portal_settings
+from astrbot.portal.config import get_portal_settings, get_sso_provider_availability
 from astrbot.portal.db.engine import get_portal_db_session
 from astrbot.portal.db.models import PortalUser
-from astrbot.portal.services import session_service
+from astrbot.portal.services import invite_service, session_service, sso_service
+from astrbot.portal.services.sso.base import SsoProviderError, SsoTemporaryError
 
 router = APIRouter(prefix="/auth", tags=["Portal Auth"])
 
@@ -62,6 +94,39 @@ class RegisterRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: str
     password: str
+
+
+class SsoLinkConfirmRequest(BaseModel):
+    """Body for ``POST /auth/sso/{provider}/link/confirm``.
+
+    Deliberately the only field: the account being linked TO is always
+    ``get_current_user``'s resolved identity (never a body field -- see
+    module docstring), and the provider/subject being linked were already
+    fixed server-side back when the callback resolved
+    ``confirmation_token`` in the first place.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    confirmation_token: str
+
+
+class InviteRedeemRequest(BaseModel):
+    """Body for ``POST /auth/invite/redeem``.
+
+    No ``email`` field, by design -- see
+    ``invite_service.redeem_invite``'s own "Email binding" docstring
+    section: which account this token activates is bound entirely to the
+    token itself, and letting the invitee supply/change an email as part of
+    redemption would be exactly the account-linking-by-attacker-supplied-
+    identity takeover shape rule 5 warns about.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    token: str
+    password: str
+    display_name: str | None = None
 
 
 def _user_payload(user: PortalUser) -> dict:
@@ -224,6 +289,171 @@ def _current_session_id_best_effort(request: Request) -> str | None:
     except TokenError:
         return None
     return payload.session_id
+
+
+# ---------------------------------------------------------------------------
+# SSO helpers (Phase 5).
+# ---------------------------------------------------------------------------
+
+_SSO_NEXT_COOKIE_NAME = "astrbot_portal_sso_next"
+"""Carries a validated post-login redirect target from ``/sso/{provider}/start``
+to ``/sso/{provider}/callback`` across the OAuth round trip. NOT part of
+``sso_service``'s own state (that module's ``state`` value is an opaque
+string it generates and verifies itself; there is no way to smuggle
+application data through it without editing a file this assignment does not
+own), so this is a small, separate, single-purpose cookie of this file's
+own. Never trusted blindly on read: validated again at write time (`/start`)
+AND at read time (`/callback`) by :func:`_validate_redirect_target` -- see
+that function's docstring for why "validated once, trusted forever" is not
+good enough here."""
+
+_SAFE_REDIRECT_PREFIX = "/portal"
+"""The ONLY allowlisted destination space for a post-SSO-login redirect --
+the portal SPA's own serving base (ground truth: "the portal SPA is served
+at /portal"). Anything else is rejected outright, never partially trusted."""
+
+
+def _validate_redirect_target(candidate: str | None) -> str | None:
+    """Return ``candidate`` unchanged if it is safe to redirect the browser
+    to after SSO login; ``None`` otherwise (callers must fall back to a
+    fixed default, never to the raw unchecked value).
+
+    This is the mitigation for the open-redirect surface an SSO callback
+    otherwise creates: if a "come back here after login" destination is
+    ever taken from a request parameter (or, as here, a cookie whose value
+    was itself derived from one) and handed to a redirect response
+    unchecked, an attacker can craft a link that authenticates the victim
+    legitimately and then bounces their browser to an attacker-controlled
+    site, which is often enough for a convincing phishing follow-up. The
+    allowlist here is deliberately a single hardcoded prefix (this SPA's
+    own base), not a regex trying to distinguish "looks like our domain"
+    from "looks like an attacker's domain" -- the only endorsed
+    destinations are pages this SPA itself serves, so anything else is
+    simply out of scope, not a judgment call.
+    """
+    if not isinstance(candidate, str) or not candidate:
+        return None
+    # A bare prefix check (``startswith("/portal")``) would also accept
+    # "/portalx" or "/portal.evil.com" -- still same-origin paths (a
+    # leading single "/" can never be read by a browser as anything but a
+    # path on the current origin, so neither is actually an open-redirect
+    # escape), but not real pages this SPA serves either. Require an exact
+    # match or a genuine path boundary right after the prefix so the
+    # allowlist means what it says.
+    if candidate != _SAFE_REDIRECT_PREFIX and not candidate.startswith(
+        _SAFE_REDIRECT_PREFIX + "/"
+    ):
+        return None
+    # Reject scheme-relative ("//evil.com/...") and backslash tricks some
+    # browsers/proxies still normalize into a scheme-relative URL, plus raw
+    # control characters that could be used to smuggle a second URL past a
+    # naive prefix check.
+    if candidate.startswith("//") or candidate.startswith("/\\"):
+        return None
+    if any(ch in candidate for ch in ("\\", "\r", "\n", "\t")):
+        return None
+    parsed = urlsplit(candidate)
+    if parsed.scheme or parsed.netloc:
+        return None
+    return candidate
+
+
+def _sso_callback_cookie_path(provider: str) -> str:
+    """The one and only path the SSO state (and next-redirect) cookies are
+    ever scoped to: this provider's own callback route, and nothing else.
+    Computed identically wherever a cookie is set or read for these two
+    purposes so the two can never drift apart -- mirrors
+    ``sso_service._redirect_uri``'s own "single convention, both call
+    sites" rationale."""
+    return f"/api/v1/portal/auth/sso/{provider}/callback"
+
+
+def _raise_for_sso_error(exc: Exception) -> NoReturn:
+    """Translate every exception ``sso_service``/``sso.base`` document as
+    able to propagate out of ``start_login``/``start_link``/
+    ``complete_callback``/``confirm_link``/``unlink`` into an HTTP response,
+    following ``sso_service.py``'s own recommended mapping verbatim (see its
+    module docstring / ``notes_for_integrator`` -- that module owns the
+    exception vocabulary and is the single source of truth for this
+    mapping, not re-derived here).
+    """
+    if isinstance(exc, sso_service.SsoRateLimitedError):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试") from exc
+    if isinstance(
+        exc,
+        (
+            sso_service.SsoDisabledError,
+            sso_service.UnknownSsoProviderError,
+            sso_service.SsoProviderNotImplementedError,
+        ),
+    ):
+        # Deliberately one generic 404 for all three: "not configured",
+        # "not a real provider id", and "no adapter yet" all mean the same
+        # thing to an outside caller -- this login method is not available
+        # -- and distinguishing them would only help someone probing for
+        # which providers exist/are half-configured.
+        raise HTTPException(status_code=404, detail="该登录方式当前不可用") from exc
+    if isinstance(exc, sso_service.InvalidSsoStateError):
+        # Acceptance criterion 3: a missing/unknown/expired/already-consumed
+        # state must all collapse to this one generic, non-distinguishing
+        # response -- exactly what InvalidSsoStateError already guarantees
+        # by construction (see its own docstring).
+        raise HTTPException(status_code=400, detail="登录状态无效或已过期，请重新登录") from exc
+    if isinstance(exc, sso_service.SsoAccountNotProvisionedError):
+        raise HTTPException(
+            status_code=403,
+            detail="该身份尚未关联任何账号，请先使用管理员邀请注册，或登录后在账号设置中绑定该登录方式",
+        ) from exc
+    if isinstance(exc, sso_service.SsoIdentityAlreadyLinkedError):
+        raise HTTPException(status_code=409, detail="该登录方式已绑定到另一个账号") from exc
+    if isinstance(exc, sso_service.SsoLinkConfirmationError):
+        raise HTTPException(status_code=400, detail="绑定确认无效或已过期，请重新发起绑定") from exc
+    if isinstance(exc, sso_service.SsoIdentityNotLinkedError):
+        raise HTTPException(status_code=404, detail="尚未绑定该登录方式") from exc
+    if isinstance(exc, sso_service.SsoCannotRemoveLastCredentialError):
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if isinstance(exc, SsoTemporaryError):
+        raise HTTPException(status_code=503, detail="登录服务暂时不可用，请稍后再试") from exc
+    if isinstance(exc, SsoProviderError):
+        # Covers SsoDiscoveryError/SsoIdentityVerificationError and any
+        # other adapter-layer verification failure -- never echo the
+        # underlying adapter exception's message (it may contain internal
+        # endpoint URLs/response fragments); a flat generic message only.
+        raise HTTPException(status_code=400, detail="身份验证失败") from exc
+    raise HTTPException(status_code=400, detail="请求失败") from exc
+
+
+def _raise_for_invite_error(exc: Exception) -> NoReturn:
+    """Translate every ``invite_service`` exception into HTTP, following
+    that module's own module-docstring "Recommended HTTP status mapping"
+    verbatim -- it is the single source of truth for this vocabulary."""
+    if isinstance(exc, invite_service.InviteRateLimitedError):
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    if isinstance(exc, invite_service.InviteInvalidError):
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    if isinstance(
+        exc,
+        (
+            invite_service.InviteAlreadyConsumedError,
+            invite_service.InviteRevokedError,
+            invite_service.InviteExpiredError,
+        ),
+    ):
+        # Acceptance criterion 2: a replayed (already-consumed) token -> 410.
+        # Revoked/expired share the same status for the same reason
+        # invite_service.py's own docstring gives: all three describe a
+        # link that used to be valid at this URL and no longer is.
+        raise HTTPException(status_code=410, detail=str(exc)) from exc
+    if isinstance(exc, invite_service.InviteEmailMismatchError):
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if isinstance(exc, invite_service.InvitePasswordPolicyError):
+        # Safe to surface the ValueError-derived message verbatim -- mirrors
+        # how PasswordPolicyError is already handled elsewhere in this
+        # module's own register-flow error translation.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if isinstance(exc, invite_service.InviteRedemptionConflictError):
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +656,338 @@ async def me(user: PortalUser = Depends(get_current_user)) -> dict:
     """Return the caller's own profile, resolved solely from the verified
     ``astrbot_portal_jwt`` cookie -- never from any client-supplied id."""
     return _user_payload(user)
+
+
+# ---------------------------------------------------------------------------
+# SSO routes (Phase 5). Availability/start/callback are public (no prior
+# session exists yet for a login attempt); link/link-confirm/unlink/linked
+# require an authenticated caller, and every state-changing one of those
+# four also requires the CSRF double-submit match, same as every other
+# authenticated write route in this module.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/sso/providers")
+async def sso_providers() -> dict:
+    """Which SSO providers are currently enabled -- for rendering login
+    buttons. Serializes ``get_sso_provider_availability()`` verbatim
+    (booleans only); never a raw ``PortalSettings`` dump, which would leak
+    ``oidc_client_secret``/``wecom_app_secret``/``feishu_app_secret``. No
+    internal endpoint URLs are exposed either -- only the public
+    ``{provider}/start`` path shape a client can already derive from this
+    router's own prefix."""
+    return {"providers": get_sso_provider_availability(get_portal_settings())}
+
+
+@router.get("/sso/linked")
+async def sso_linked(
+    user: PortalUser = Depends(get_current_user),
+    db_session: AsyncSession = Depends(get_portal_db_session),
+) -> dict:
+    """Which providers are currently linked to the caller's own account --
+    not explicitly enumerated in this phase's route list, but a direct,
+    read-only, already-implemented service call
+    (``sso_service.list_linked_providers``) an account-settings "linked
+    identities" page needs in order to render its unlink buttons/self-
+    lockout warning sensibly; adding it here rather than leaving the SPA to
+    infer link state from ``/me`` (which does not carry it). Declared here,
+    before the ``/sso/{provider}/...`` parametrized routes below, matching
+    this package's own stated convention (see ``admin_routes.py``'s module
+    docstring) of static sub-paths first -- there is no actual collision
+    (every parametrized route below has two path segments after ``/sso/``,
+    this one has exactly one), but keeping the ordering consistent avoids
+    ever having to reason about it again if a route is added later.
+    """
+    providers = await sso_service.list_linked_providers(db_session, user_id=user.user_id)
+    return {"linked_providers": providers}
+
+
+@router.get("/sso/{provider}/start")
+async def sso_start(
+    provider: str,
+    request: Request,
+    next: str | None = None,  # noqa: A002 - query param name, mirrors the public API shape
+) -> Response:
+    """Begin a LOGIN-purpose SSO flow: redirect the browser to the IdP.
+
+    ``next`` (optional): where to send the browser after a successful
+    login, validated against :func:`_validate_redirect_target` -- an
+    invalid/absent value silently falls back to the SPA's own root
+    (``/portal``), it never fails the request. The validated value (if any)
+    is stashed in a short-lived, httpOnly cookie scoped to exactly this
+    provider's callback path -- ``state`` itself is an opaque value entirely
+    owned/verified by ``sso_service`` with no room to carry extra
+    application data, so this is a small, separate cookie for that one
+    purpose (see ``_SSO_NEXT_COOKIE_NAME``'s own docstring).
+    """
+    ip = _client_ip(request)
+    try:
+        result = await sso_service.start_login(provider_id=provider, ip=ip)
+    except (
+        sso_service.SsoDisabledError,
+        sso_service.UnknownSsoProviderError,
+        sso_service.SsoProviderNotImplementedError,
+        sso_service.SsoRateLimitedError,
+        SsoProviderError,
+    ) as exc:
+        _raise_for_sso_error(exc)
+
+    secure = _is_secure_request(request)
+    callback_path = _sso_callback_cookie_path(provider)
+    redirect_response = Response(status_code=302, headers={"Location": result.authorize_url})
+    redirect_response.set_cookie(
+        sso_service.SSO_STATE_COOKIE_NAME,
+        result.state,
+        max_age=result.state_cookie_max_age_seconds,
+        httponly=True,
+        samesite="lax",
+        secure=secure,
+        path=callback_path,
+    )
+    safe_next = _validate_redirect_target(next)
+    if safe_next is not None:
+        redirect_response.set_cookie(
+            _SSO_NEXT_COOKIE_NAME,
+            safe_next,
+            max_age=result.state_cookie_max_age_seconds,
+            httponly=True,
+            samesite="lax",
+            secure=secure,
+            path=callback_path,
+        )
+    return redirect_response
+
+
+@router.get("/sso/{provider}/callback")
+async def sso_callback(
+    provider: str,
+    request: Request,
+    response: Response,
+    code: str | None = None,
+    state: str | None = None,
+    db_session: AsyncSession = Depends(get_portal_db_session),
+) -> dict:
+    """Complete an SSO flow (LOGIN or LINK -- which one is resolved
+    entirely server-side by ``sso_service`` from the pending flow it stored
+    at ``/start`` time, never taken from anything on this request).
+
+    Returns JSON rather than issuing an HTTP redirect itself: the SPA's own
+    ``OAuthCallbackPage`` calls this endpoint (it is what the IdP's
+    ``redirect_uri`` actually points at, per ``sso_service._redirect_uri``'s
+    convention -- an SPA page, not this API route) and performs any further
+    client-side navigation itself. This sidesteps the open-redirect surface
+    for the common case entirely rather than mitigating it after the fact;
+    the one place this file still hands back a redirect *target* (the
+    validated ``redirect_to`` field below, sourced from the ``next`` cookie
+    set at ``/start``) is still validated against the same allowlist before
+    being echoed, never trusted just because it came from our own cookie.
+
+    A missing ``code``/``state`` is rejected identically to every other
+    "this didn't work" case below (acceptance criterion 3): no
+    distinguishing response for "you sent nothing" vs. "you sent an
+    unrecognized/expired/already-used state".
+    """
+    ip = _client_ip(request)
+    state_cookie_value = request.cookies.get(sso_service.SSO_STATE_COOKIE_NAME)
+    # Cookies are single-purpose and single-use regardless of outcome below
+    # -- always clear both on the way out so a retried/refreshed callback
+    # request can never present a stale state/next pairing a second time.
+    callback_path = _sso_callback_cookie_path(provider)
+    secure = _is_secure_request(request)
+
+    def _clear_sso_cookies() -> None:
+        response.delete_cookie(
+            sso_service.SSO_STATE_COOKIE_NAME,
+            path=callback_path,
+            httponly=True,
+            samesite="lax",
+            secure=secure,
+        )
+        response.delete_cookie(
+            _SSO_NEXT_COOKIE_NAME,
+            path=callback_path,
+            httponly=True,
+            samesite="lax",
+            secure=secure,
+        )
+
+    if not code or not state:
+        _clear_sso_cookies()
+        raise HTTPException(status_code=400, detail="登录状态无效或已过期，请重新登录")
+
+    next_cookie = request.cookies.get(_SSO_NEXT_COOKIE_NAME)
+
+    try:
+        result = await sso_service.complete_callback(
+            db_session,
+            provider_id=provider,
+            state=state,
+            state_cookie_value=state_cookie_value,
+            code=code,
+            ip=ip,
+            user_agent=request.headers.get("user-agent"),
+        )
+    except (sso_service.SsoServiceError, SsoProviderError) as exc:
+        _clear_sso_cookies()
+        _raise_for_sso_error(exc)
+
+    _clear_sso_cookies()
+
+    if isinstance(result, sso_service.SsoLoginResult):
+        csrf_token = generate_csrf_token()
+        _set_auth_cookies(request, response, result.token_pair, csrf_token)
+        redirect_to = _validate_redirect_target(next_cookie) or "/portal"
+        return {
+            "result": "login",
+            "user": _user_payload(result.user),
+            "redirect_to": redirect_to,
+        }
+
+    # SsoLinkPendingResult: no binding has been written yet -- the SPA must
+    # still call /sso/{provider}/link/confirm while authenticated as the
+    # same account that started the flow (see confirm_link's own docstring
+    # for why that ownership check is what makes this unforgeable).
+    return {
+        "result": "link_pending",
+        "provider": result.provider,
+        "email": result.email,
+        "display_name": result.display_name,
+        "confirmation_token": result.confirmation_token,
+        "expires_at": result.expires_at.isoformat(),
+    }
+
+
+@router.post("/sso/{provider}/link")
+async def sso_link_start(
+    provider: str,
+    request: Request,
+    response: Response,
+    user: PortalUser = Depends(get_current_user),
+    _csrf: None = Depends(require_csrf),
+) -> dict:
+    """Begin a LINK-purpose SSO flow for the currently-authenticated
+    account. ``POST`` (not a plain link/redirect like ``/start``) precisely
+    because this is an authenticated, state-initiating action that must go
+    through the CSRF double-submit check -- the SPA is expected to call
+    this via ``fetch``/XHR and then navigate the browser to the returned
+    ``authorize_url`` itself, exactly mirroring how ``/start`` sets its own
+    state cookie, just on a JSON response instead of a redirect response.
+    """
+    ip = _client_ip(request)
+    try:
+        result = await sso_service.start_link(
+            provider_id=provider, user_id=user.user_id, ip=ip
+        )
+    except (sso_service.SsoServiceError, SsoProviderError) as exc:
+        _raise_for_sso_error(exc)
+
+    response.set_cookie(
+        sso_service.SSO_STATE_COOKIE_NAME,
+        result.state,
+        max_age=result.state_cookie_max_age_seconds,
+        httponly=True,
+        samesite="lax",
+        secure=_is_secure_request(request),
+        path=_sso_callback_cookie_path(provider),
+    )
+    return {"authorize_url": result.authorize_url}
+
+
+@router.post("/sso/{provider}/link/confirm")
+async def sso_link_confirm(
+    provider: str,
+    payload: SsoLinkConfirmRequest,
+    user: PortalUser = Depends(get_current_user),
+    _csrf: None = Depends(require_csrf),
+    db_session: AsyncSession = Depends(get_portal_db_session),
+) -> dict:
+    """The explicit second-confirmation step (acceptance criterion 4): the
+    callback above never wrote a binding for a LINK-purpose flow, only an
+    opaque ``confirmation_token``. This is the one call that actually binds
+    a ``PortalOAuthIdentity`` row to ``user.user_id`` -- the caller's own
+    verified identity from ``get_current_user``, never a client-supplied
+    field, which is exactly what makes ``confirmation_token`` alone
+    (without also being logged in as the right account) useless to an
+    attacker. Unconfirmed (token never presented, or presented by/for the
+    wrong account) means no binding ever takes effect -- there is no
+    fallback path that links on callback completion alone.
+    """
+    try:
+        identity = await sso_service.confirm_link(
+            db_session,
+            user_id=user.user_id,
+            confirmation_token=payload.confirmation_token,
+        )
+    except sso_service.SsoServiceError as exc:
+        _raise_for_sso_error(exc)
+    return {"success": True, "provider": identity.provider}
+
+
+@router.post("/sso/{provider}/unlink")
+async def sso_unlink(
+    provider: str,
+    user: PortalUser = Depends(get_current_user),
+    _csrf: None = Depends(require_csrf),
+    db_session: AsyncSession = Depends(get_portal_db_session),
+) -> dict:
+    """Remove a linked identity. The self-lockout guard
+    (``SsoCannotRemoveLastCredentialError`` -> 409) lives entirely inside
+    ``sso_service.unlink`` -- this route adds no additional check, it just
+    surfaces that refusal as the recommended status code."""
+    try:
+        await sso_service.unlink(db_session, user_id=user.user_id, provider_id=provider)
+    except sso_service.SsoServiceError as exc:
+        _raise_for_sso_error(exc)
+    return {"success": True}
+
+
+# ---------------------------------------------------------------------------
+# Invite redemption (Phase 5a).
+# ---------------------------------------------------------------------------
+
+
+@router.post("/invite/redeem")
+async def redeem_invite(
+    payload: InviteRedeemRequest,
+    request: Request,
+    response: Response,
+) -> dict:
+    """Redeem a one-time admin-issued invite link: set a password, activate
+    the pre-created account, and log the invitee straight in.
+
+    Rate-limited entirely inside ``invite_service.redeem_invite`` itself
+    (keyed by the invite_id parsed from the token, plus IP) -- this route
+    deliberately does NOT call ``get_login_throttle().check(...)`` again
+    with the same account key first, per that function's own
+    ``notes_for_integrator``: doing so would double-consume the same
+    bucket. A replayed (already-consumed) token returns 410 (acceptance
+    criterion 2); an unknown/malformed token and a wrong secret for a real
+    one both return the same generic 401 (see
+    ``invite_service.InviteInvalidError``'s own docstring for why that
+    collapsing is deliberate, not an oversight).
+    """
+    ip = _client_ip(request)
+    try:
+        result = await invite_service.redeem_invite(
+            token=payload.token,
+            password=payload.password,
+            display_name=payload.display_name,
+            ip=ip,
+            user_agent=request.headers.get("user-agent"),
+        )
+    except invite_service.InviteServiceError as exc:
+        _raise_for_invite_error(exc)
+
+    csrf_token = generate_csrf_token()
+    _set_auth_cookies(request, response, result.token_pair, csrf_token)
+    logger.info(f"[portal] invite redeemed, new active user: {result.user_id}")
+    return {
+        "user_id": result.user_id,
+        "email": result.email,
+        "display_name": result.display_name,
+        "role": "user",
+        "status": "active",
+    }
 
 
 __all__ = ["router"]

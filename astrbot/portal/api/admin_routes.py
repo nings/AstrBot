@@ -1,5 +1,8 @@
 """Operator-only admin HTTP routes for the AstrBot Portal module (Phase 3
-KB-visibility CRUD; Phase 4 adds Agent Bundle CRUD below, same conventions).
+KB-visibility CRUD; Phase 4 adds Agent Bundle CRUD; Phase 5 adds invite
+issuance/listing/revocation and portal-user list/disable/enable below, same
+conventions -- every new route is gated by the same
+``Depends(require_system_scope)``, no exception).
 
 Every handler here is gated by ``Depends(require_system_scope)`` imported
 **verbatim** from ``astrbot.dashboard.api.auth`` -- the core dashboard's own
@@ -92,13 +95,23 @@ principle must be extended here too.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import col, select
 
+from astrbot import logger
 from astrbot.dashboard.api.auth import AuthContext, require_system_scope
-from astrbot.portal.services import agent_bundle_service, kb_visibility_service
+from astrbot.portal.db.engine import get_portal_db_session
+from astrbot.portal.db.models import PortalSession, PortalUser
+from astrbot.portal.services import (
+    agent_bundle_service,
+    invite_service,
+    kb_visibility_service,
+)
 from astrbot.portal.services.agent_bundle_service import (
     AgentBundleServiceError,
     KbNotVisibleError,
@@ -190,6 +203,24 @@ class SetAgentBundleEnabledRequest(BaseModel):
     enabled: bool
 
 
+class CreateInviteRequest(BaseModel):
+    """Body for ``POST /admin/invites``.
+
+    ``display_name`` is optional -- ``invite_service.admin_create_invite``
+    derives a placeholder from the email's local-part when omitted (the
+    invitee can personalize it during redemption). There is deliberately no
+    ``role``/``status`` field here: every invite-created account starts as
+    an ordinary ``role='user'`` account (see ``invite_service.py``'s own
+    ``admin_create_invite``), matching this phase's scope of "provision an
+    end user", not "provision an operator".
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    email: str = Field(min_length=3, max_length=255)
+    display_name: str | None = Field(default=None, max_length=100)
+
+
 # ---------------------------------------------------------------------------
 # Error translation. Unlike kb_routes.py, a plain 404 here is NOT an
 # existence-oracle concern: the caller is an authenticated operator whose
@@ -228,6 +259,29 @@ def _raise_for_admin_bundle_error(exc: Exception) -> NoReturn:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if isinstance(exc, AgentBundleServiceError):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Error translation for invite CRUD (Phase 5a). Mapping follows
+# ``invite_service.py``'s own module docstring, "Recommended HTTP status
+# mapping" section, verbatim -- that module is the single source of truth
+# for this vocabulary since it owns the exception hierarchy.
+# ---------------------------------------------------------------------------
+
+
+def _raise_for_admin_invite_error(exc: Exception) -> NoReturn:
+    if isinstance(exc, invite_service.InviteNotFoundError):
+        raise HTTPException(status_code=404, detail=str(exc) or "Not found") from exc
+    if isinstance(exc, invite_service.InviteAlreadyConsumedError):
+        # Same 410 as the public redemption-replay case -- it is the same
+        # exception type describing the same underlying fact ("this invite
+        # was already used"), just reached from the admin revoke path
+        # instead of the redeem path. See invite_service.py's own mapping
+        # table: it is the single source of truth this file defers to.
+        raise HTTPException(status_code=410, detail=str(exc)) from exc
+    if isinstance(exc, invite_service.InviteEmailAlreadyRegisteredError):
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
@@ -477,6 +531,245 @@ async def set_agent_bundle_enabled(
         )
     except ResourceNotFoundError as exc:
         _raise_for_admin_bundle_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Invite CRUD (Phase 5a). All authorization/state logic lives in
+# ``invite_service.py``, which -- exactly like ``kb_visibility_service.py``/
+# ``agent_bundle_service.py`` before it -- performs zero authorization
+# checks of its own and trusts this router's ``Depends(require_system_scope)``
+# completely. ``created_by``/``revoked_by`` are always sourced from
+# ``AuthContext.username`` -- never from the request body -- same
+# convention as ``granted_by``/``updated_by`` above.
+# ---------------------------------------------------------------------------
+
+
+@router.post("/invites")
+async def create_invite(
+    payload: CreateInviteRequest,
+    auth: AuthContext = Depends(require_system_scope),
+) -> dict[str, Any]:
+    """Issue a one-time invite link for ``payload.email``.
+
+    **The response's ``invite_token``/``invite_link`` fields are the ONLY
+    time the plaintext token is ever returned** -- see
+    ``invite_service.admin_create_invite``'s own docstring: from the next
+    request onward only its PBKDF2 hash exists anywhere, and there is no
+    way to recover it again, by this endpoint or anyone else. There is no
+    mail infrastructure in this repository (no ``smtplib``/``aiosmtplib``
+    usage exists anywhere) -- the operator UI calling this endpoint MUST
+    surface this value and make explicit that delivering it to the invitee
+    (chat, ticket, however they reach them) is the operator's own
+    responsibility, not something this call performs.
+
+    409 if ``email`` already belongs to an ``'active'``/``'disabled'``
+    account (:class:`invite_service.InviteEmailAlreadyRegisteredError`); a
+    still-``'invited'`` address is instead silently reissued a fresh invite
+    against the same pre-created user (see that function's own docstring).
+    400 for a malformed email.
+    """
+    try:
+        entry, plaintext_token = await invite_service.admin_create_invite(
+            email=payload.email,
+            created_by=auth.username,
+            display_name=payload.display_name,
+        )
+    except invite_service.InviteServiceError as exc:
+        _raise_for_admin_invite_error(exc)
+    invite_link = f"/portal/invite/accept?token={plaintext_token}"
+    return {
+        **entry,
+        "invite_token": plaintext_token,
+        "invite_link": invite_link,
+    }
+
+
+@router.get("/invites")
+async def list_invites(
+    _auth: AuthContext = Depends(require_system_scope),
+) -> dict[str, Any]:
+    """Every invite ever issued, most recent first, each with its computed
+    ``status`` (``'pending'``/``'consumed'``/``'revoked'``/``'expired'``).
+    **Never** includes a plaintext token or its hash -- see
+    ``invite_service._admin_entry``'s own docstring; the plaintext is only
+    ever available once, from :func:`create_invite`'s own response."""
+    entries = await invite_service.admin_list_invites()
+    return {"invites": entries}
+
+
+@router.post("/invites/{invite_id}/revoke")
+async def revoke_invite(
+    invite_id: str,
+    auth: AuthContext = Depends(require_system_scope),
+) -> dict[str, Any]:
+    """Cancel an outstanding (not yet redeemed) invite. 404 if no such
+    invite exists; 410 if it was already redeemed (revoking an already-
+    activated account is a separate, out-of-scope "disable the user"
+    operation -- see :func:`disable_portal_user` below -- not something
+    "revoking the invite" could retroactively undo). Idempotent for an
+    already-revoked invite."""
+    try:
+        return await invite_service.admin_revoke_invite(invite_id, revoked_by=auth.username)
+    except invite_service.InviteServiceError as exc:
+        _raise_for_admin_invite_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Portal-user list/disable/enable (Phase 5). Unlike the invite/kb-visibility/
+# agent-bundle CRUD above, there is no dedicated service module for this --
+# this assignment's ownership is exactly ``admin_routes.py``/``auth_routes.py``,
+# and neither ``session_service.py`` nor ``astrbot/portal/db/models.py`` is
+# this assignment's to modify, so the handful of direct ``PortalUser``/
+# ``PortalSession`` queries below live inline rather than inventing a new
+# service module out of scope. Every query goes through
+# ``get_portal_db_session`` exactly like every other route in this package.
+# ---------------------------------------------------------------------------
+
+
+def _admin_user_entry(user: PortalUser) -> dict[str, Any]:
+    """Operator-facing shape of one ``PortalUser`` row. Never includes
+    ``password_hash`` -- mirrors ``auth_routes.py``'s own ``_user_payload``
+    but additionally exposes ``auth_method``/timestamps, which only an
+    operator (not the user's own ``/auth/me``) needs to see."""
+    return {
+        "user_id": user.user_id,
+        "email": user.email,
+        "display_name": user.display_name,
+        "role": user.role,
+        "status": user.status,
+        "auth_method": user.auth_method,
+        "created_at": user.created_at.isoformat(),
+        "updated_at": user.updated_at.isoformat(),
+    }
+
+
+async def _revoke_all_sessions_for_user(db_session: AsyncSession, *, user_id: str) -> None:
+    """Revoke every not-yet-revoked ``PortalSession`` row belonging to
+    ``user_id``, across *every* token family.
+
+    ``session_service.revoke_family`` (the only bulk-revoke primitive that
+    module exposes) only ever revokes the ONE family behind whichever
+    refresh token triggered it -- correct for replay detection, but not
+    enough here: a single user may hold several independently-issued
+    families at once (multiple devices/browsers, each login mints a fresh
+    ``family_id`` -- see ``session_service.issue_token_pair``'s own
+    docstring). Disabling an account must kill all of them, so this queries
+    by ``user_id`` directly instead, mirroring ``revoke_family``'s own
+    conditional-update-over-not-yet-revoked-rows shape.
+    """
+    now = datetime.now(timezone.utc)
+    result = await db_session.execute(
+        select(PortalSession).where(
+            col(PortalSession.user_id) == user_id,
+            col(PortalSession.revoked_at).is_(None),
+        )
+    )
+    rows = result.scalars().all()
+    for row in rows:
+        row.revoked_at = now
+        db_session.add(row)
+    if rows:
+        await db_session.commit()
+
+
+@router.get("/users")
+async def list_portal_users(
+    db_session: AsyncSession = Depends(get_portal_db_session),
+    _auth: AuthContext = Depends(require_system_scope),
+) -> dict[str, Any]:
+    """Every ``PortalUser`` row (any ``status``), most recently created
+    first -- the operator's full-inventory view, including ``auth_method``/
+    ``status`` so a stuck ``'invited'`` account or a disabled one is
+    visible, not silently hidden."""
+    result = await db_session.execute(
+        select(PortalUser).order_by(col(PortalUser.created_at).desc())
+    )
+    users = result.scalars().all()
+    return {"users": [_admin_user_entry(user) for user in users]}
+
+
+@router.post("/users/{user_id}/disable")
+async def disable_portal_user(
+    user_id: str,
+    db_session: AsyncSession = Depends(get_portal_db_session),
+    auth: AuthContext = Depends(require_system_scope),
+) -> dict[str, Any]:
+    """Disable a portal end-user account and make that **actually** cut off
+    access, not just flip a flag nothing else checks.
+
+    Two independent effects, both required:
+
+    1. ``PortalUser.status = 'disabled'``. This alone is already enough to
+       stop any *future* request that resolves an identity via
+       ``astrbot.portal.auth.dependencies.get_current_user`` -- that
+       dependency re-reads the ``PortalUser`` row from the database on
+       every single call (never trusts only the JWT payload) and 403s on
+       any non-``'active'`` status. So an already-issued, still-unexpired
+       access token stops being useful the very next time it is presented
+       to any real endpoint.
+    2. Revoking **every** ``PortalSession`` row for this user (see
+       :func:`_revoke_all_sessions_for_user`). This is the part a flag
+       alone would NOT cover: ``session_service.rotate_refresh`` never
+       looks at ``PortalUser.status`` at all -- it only inspects the
+       ``PortalSession`` row's own ``revoked_at``/``expires_at``/hash. Without
+       this step, a disabled user could keep calling ``/auth/refresh``
+       indefinitely, minting fresh access tokens forever (each one
+       individually useless against ``get_current_user``, but the refresh
+       family itself would stay alive and immediately usable again the
+       moment -- if ever -- the account is re-enabled, which is not the
+       "cut off" semantics "disable" is supposed to mean). Revoking every
+       session closes that gap outright: a disabled user cannot refresh at
+       all afterward, full stop.
+
+    404 if no such user exists. Idempotent if already disabled (sessions
+    are still (re-)swept every call, which is harmless -- there is nothing
+    left un-revoked after the first call).
+    """
+    user = await db_session.get(PortalUser, user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.status != "disabled":
+        user.status = "disabled"
+        db_session.add(user)
+        await db_session.commit()
+        await db_session.refresh(user)
+    await _revoke_all_sessions_for_user(db_session, user_id=user_id)
+    logger.info(f"[portal] admin {auth.username!r} disabled user {user_id}")
+    return _admin_user_entry(user)
+
+
+@router.post("/users/{user_id}/enable")
+async def enable_portal_user(
+    user_id: str,
+    db_session: AsyncSession = Depends(get_portal_db_session),
+    auth: AuthContext = Depends(require_system_scope),
+) -> dict[str, Any]:
+    """Re-enable a previously-disabled account (``status`` back to
+    ``'active'``). Does not, and cannot, restore any session revoked by
+    :func:`disable_portal_user` -- the user simply logs in again normally.
+
+    409 if the account's current status is ``'invited'`` -- that is a
+    fundamentally different resting state (no password has ever been set;
+    see ``PortalInvite``'s own docstring) that this endpoint does not
+    "fix"; the correct remedy there is re-issuing (or waiting out) an
+    invite via :func:`create_invite`, not toggling this flag. 404 if no
+    such user exists. Idempotent if already active.
+    """
+    user = await db_session.get(PortalUser, user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.status == "invited":
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot enable an account that has not accepted its invite yet",
+        )
+    if user.status != "active":
+        user.status = "active"
+        db_session.add(user)
+        await db_session.commit()
+        await db_session.refresh(user)
+    logger.info(f"[portal] admin {auth.username!r} re-enabled user {user_id}")
+    return _admin_user_entry(user)
 
 
 __all__ = ["router"]
