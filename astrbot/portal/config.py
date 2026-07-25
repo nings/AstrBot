@@ -105,6 +105,112 @@ class PortalSettings:
     max_concurrent_runs_per_user: int = 2
     """Max simultaneously in-flight chat runs allowed for a single user."""
 
+    # --- Upload policy (Phase 2: file/image attachments) --------------------
+    #
+    # None of these limits exist in core today: `ChatService.save_uploaded_file`
+    # (`astrbot/dashboard/services/chat_service.py:592-640`) has no size cap
+    # and no MIME allowlist whatsoever -- it derives `attach_type` purely from
+    # the client-supplied multipart `content_type` and, for anything that
+    # isn't an image, never even sniffs the real bytes. The portal is the
+    # only layer that will ever enforce these, so getting sane defaults here
+    # matters; see `PortalAttachmentOwner` (db/models.py) for the byte_size
+    # bookkeeping and `PortalUsageCounter.uploaded_bytes` for the rolling
+    # daily total these limits are checked against.
+    max_upload_file_bytes: int = 20 * 1024 * 1024
+    """Hard cap on a single uploaded file, in bytes (20 MiB).
+
+    Chosen as a middle ground for a consumer chat product: comfortably
+    above a typical phone camera photo (2-8 MB) or a multi-minute voice
+    recording encoded as compressed audio, while still small enough that
+    a handful of concurrent uploads can't exhaust disk or memory on a
+    single-process, single-SQLite-writer deployment (see plan section 6's
+    SQLite single-writer risk entry). Deliberately conservative rather
+    than generous: raising a limit later is a trivial, low-risk config
+    change; a deployment that got hit with disk exhaustion because the
+    default was too permissive is not. Applies uniformly across all
+    `attach_type`s for Phase 2 -- there is no per-type override yet.
+    """
+
+    max_daily_upload_bytes: int = 200 * 1024 * 1024
+    """Rolling per-user daily upload quota, in bytes (200 MiB).
+
+    Sized as roughly 10x `max_upload_file_bytes`, i.e. a real user can
+    still have a heavy attachment day (multiple photos, a couple of voice
+    notes, a document) without hitting the ceiling, while a compromised or
+    abusive account can't use the upload endpoint as free unbounded
+    storage against the operator's disk. Checked against
+    `PortalUsageCounter.uploaded_bytes` for the current day's window
+    before the upload route accepts a file; when exceeded the route
+    should return 429 with the remaining-quota figure (plan section 5,
+    Phase 2 acceptance criterion 3), not silently truncate or drop the
+    upload.
+    """
+
+    allowed_upload_mime_types: frozenset[str] = frozenset(
+        {
+            # Images (attach_type='image'; core re-sniffs the real bytes for
+            # these via detect_image_mime_type_async, so this allowlist is
+            # the pre-sniff gate on the client's declared content_type).
+            "image/jpeg",
+            "image/png",
+            "image/webp",
+            "image/gif",
+            # Audio / voice messages (attach_type='record'). Core does NOT
+            # sniff these -- this allowlist is the only validation they get.
+            "audio/mpeg",
+            "audio/mp4",
+            "audio/wav",
+            "audio/x-wav",
+            "audio/webm",
+            "audio/ogg",
+            "audio/aac",
+            # Video (attach_type='video'). Also unsniffed by core.
+            "video/mp4",
+            "video/webm",
+            "video/quicktime",
+            # Plain documents (attach_type='file'). Also unsniffed by core.
+            "application/pdf",
+            "text/plain",
+            "text/csv",
+            "application/json",
+        }
+    )
+    """MIME-type allowlist for uploads, enforced against the client-declared
+    `content_type` before core ever writes bytes to disk (and, for images,
+    re-checked against core's post-sniff detected MIME).
+
+    Deliberately excludes anything that renders/executes as active content
+    if served back to a browser or that commonly disguises unwanted
+    payloads: no `image/svg+xml` (SVG can carry embedded `<script>`, an XSS
+    vector when this attachment is later served or previewed), no
+    `text/html`/`application/javascript`, no archive formats
+    (`application/zip` and friends -- zip-bomb/decompression and
+    "malware disguised as a document" risk, and archives are not a useful
+    input to a multimodal chat model anyway), and no Office macro-enabled
+    formats. Legacy/macro-enabled MS Office (`.doc`/`.xls`/`.ppt`,
+    `application/vnd.ms-*`) and their modern OOXML equivalents
+    (`application/vnd.openxmlformats-officedocument.*`) are also left off
+    this default list -- if a deployment needs them, add the specific MIME
+    types deliberately rather than opening the whole Office family
+    (`.doc`/`.xls` can carry macros; the newer OOXML types are safer but
+    still parsed by third-party libraries with their own attack surface).
+    This is a static allowlist for Phase 2; there is no admin-configurable
+    override yet (matches this dataclass's existing "no on-disk override
+    mechanism" limitation noted on `get_portal_settings`).
+    """
+
+    allowed_upload_attach_types: frozenset[str] = frozenset(
+        {"image", "record", "video", "file"}
+    )
+    """Allowlist of `attach_type` buckets (core's own vocabulary from
+    `ChatService.save_uploaded_file`: 'image' | 'record' | 'video' | 'file')
+    the upload route will accept. Ships with all four enabled by default --
+    the MIME allowlist above is what actually keeps this Phase 2 default
+    narrow and safe, this list exists as a second, independent knob (e.g. a
+    deployment that wants to disable video uploads entirely to save disk,
+    without touching the MIME list) rather than as the primary gate.
+    """
+
 
 DEFAULT_PORTAL_SETTINGS = PortalSettings()
 
