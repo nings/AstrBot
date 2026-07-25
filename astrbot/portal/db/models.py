@@ -21,21 +21,28 @@ columns. Only ``user_id`` foreign keys *within this module's own tables*
 ``PortalAttachmentOwner.user_id`` -> ``PortalUser.user_id``) are declared,
 since those are safe same-database, same-metadata relationships.
 
-``PortalAttachmentOwner`` and ``PortalKbVisibility`` are the exceptions to
-"no references into core tables": they associate with core's
-``astrbot.core.db.po.Attachment`` and
-``astrbot.core.knowledge_base.models.KnowledgeBase`` respectively by
-*value* (``attachment_id`` / ``kb_id`` string equality), never by a real
-SQLAlchemy ``ForeignKey`` -- both core tables live in database files
-separate from this module's own (``data/data_v4.db`` and the knowledge-base
-module's own database file, vs this module's ``data/portal/portal.db``),
-and SQLite has no cross-database-file FK mechanism. See each class's
-docstring below for the specific gap each table exists to fill: core's
-``Attachment`` has no owner column at all, and core's ``KnowledgeBase`` is a
-global operator resource with no owner column either -- but for KBs the
-portal doesn't need per-user *ownership*, it needs an admin-curated
-*visibility whitelist*, since every end user shares the same pool of
-operator-provisioned corpora.
+``PortalAttachmentOwner``, ``PortalKbVisibility`` and ``PortalAgentBundle``
+are the exceptions to "no references into core tables": they associate with
+core's ``astrbot.core.db.po.Attachment``,
+``astrbot.core.knowledge_base.models.KnowledgeBase``, and (respectively,
+for ``PortalAgentBundle``) core's persona names
+(``astrbot.core.persona_mgr.PersonaManager.personas_v3``) and provider ids
+(``astrbot.core.provider.manager.ProviderManager.inst_map``) by *value*
+(string equality), never by a real SQLAlchemy ``ForeignKey`` -- the first
+two core resources live in database files separate from this module's own
+(``data/data_v4.db`` and the knowledge-base module's own database file, vs
+this module's ``data/portal/portal.db``), and SQLite has no cross-database-
+file FK mechanism; persona names and provider ids are not database rows at
+all but in-memory config-derived identifiers with no table to reference in
+the first place. See each class's docstring below for the specific gap
+each table exists to fill: core's ``Attachment`` has no owner column at
+all, core's ``KnowledgeBase`` is a global operator resource with no owner
+column either -- but for KBs the portal doesn't need per-user *ownership*,
+it needs an admin-curated *visibility whitelist*, since every end user
+shares the same pool of operator-provisioned corpora -- and
+``PortalAgentBundle`` is the indirection that lets an end user "choose an
+agent" without ever naming a persona or provider directly, since the
+client must never be trusted to supply either (see this module's rule 6).
 """
 
 from __future__ import annotations
@@ -442,6 +449,235 @@ class PortalKbVisibility(PortalBaseModel, table=True):
     ``_add_missing_columns`` if this field is ever added after initial
     rollout, and because it is informational/audit-only, never used in an
     authorization decision."""
+    created_at: datetime = Field(default_factory=_utcnow, nullable=False)
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        nullable=False,
+        sa_column_kwargs={"onupdate": _utcnow},
+    )
+
+
+class PortalAgentBundle(PortalBaseModel, table=True):
+    """Admin-curated preset an end user may select for a session: "pick an
+    agent" without the client ever naming a persona, provider, or knowledge
+    base directly.
+
+    This is the load-bearing indirection behind rule 6 (never accept a
+    provider/model/persona id from the client except as a bundle id): the
+    portal's end-user surface only ever exposes ``bundle_id`` values drawn
+    from this table's ``enabled=True`` rows. The server resolves what a
+    bundle *means* -- which persona, which chat provider, which knowledge
+    bases -- and writes those resolved values into core's own per-session
+    binding surfaces. The client never sees, and never supplies, a persona
+    name or a provider id.
+
+    Three fields here (``persona_id``, ``chat_provider_id``, the KB ids
+    encoded in ``kb_ids_json``) associate with core or another portal table
+    **by value only, never by a real SQLAlchemy ``ForeignKey``** -- see the
+    module docstring above for why (cross-database-file for the KB case;
+    no table at all, just in-memory config-derived identifiers, for persona
+    and provider). Concretely:
+
+    * ``persona_id`` matches a name in
+      ``PersonaManager.personas_v3`` (``astrbot/core/persona_mgr.py``) --
+      the same string space ``get_persona_v3_by_id``/
+      ``resolve_selected_persona`` search by ``item["name"]``.
+    * ``chat_provider_id`` matches a key in
+      ``ProviderManager.inst_map`` (``astrbot/core/provider/manager.py``) --
+      the same string space ``get_using_provider`` and
+      ``get_provider_by_id`` look up by.
+    * Each id encoded in ``kb_ids_json`` matches a
+      ``PortalKbVisibility.kb_id`` **that is also currently
+      ``enabled=True``** -- see "KB whitelist enforcement" below for why
+      this one is validated against a portal table rather than core
+      directly.
+
+    **Dangling references and why none of them can corrupt a session:**
+    the operator can delete a persona, remove/reconfigure a provider, or
+    revoke a KB's portal visibility out from under a bundle that already
+    references it, at any time, with no cascading delete and no referential
+    integrity to stop them (by design -- see above). Rather than a stored
+    reverse-index or an on-delete hook, dangling is handled entirely at
+    *resolution time*, matching each surface's own existing graceful
+    behaviour rather than inventing a new one:
+
+    * Persona: ``resolve_selected_persona`` already treats an id with no
+      matching ``personas_v3`` entry as "no persona found" and (on the
+      ``webchat`` platform every portal session runs on) falls back to the
+      built-in ``_chatui_default_`` persona -- never a crash, never the
+      previous persona silently staying in effect forever.
+    * Provider: ``get_using_provider`` already treats
+      ``inst_map.get(provider_id)`` returning ``None`` as "no per-umo
+      preference" and falls through to the operator's own
+      ``default_provider_id`` (and, failing that, the first configured
+      provider instance) -- exactly core's own pre-existing default-closed
+      behaviour, not a portal invention.
+    * Knowledge bases: core's own ``retrieve_knowledge_base``
+      (``astrbot/core/tools/knowledge_base_tools.py``) already logs and
+      skips any ``kb_id`` that no longer resolves via ``kb_mgr.get_kb``,
+      so a KB deleted from core entirely degrades gracefully on its own.
+      That is a *different* failure mode from the one this table's
+      whitelist check guards against, though: a KB can still exist in core,
+      unmodified, while an admin revokes its ``PortalKbVisibility`` row
+      (or flips it to ``enabled=False``) after this bundle was created with
+      it. Core has no idea that ever happened -- it would keep serving that
+      corpus to any session bound to it. Whoever applies a bundle to a
+      session (``agent_bundle_service.py``, not this file) MUST re-check
+      every id in ``kb_ids_json`` against **current**
+      ``PortalKbVisibility`` state at apply time, silently dropping any id
+      that is no longer ``enabled=True`` there (logging a warning, the same
+      shape core's own skip-and-log above already uses) rather than
+      trusting that whatever passed validation when the bundle was created
+      or last edited is still valid now.
+
+    **KB whitelist enforcement -- yes, always, at both ends:** a bundle
+    must never be able to smuggle in a corpus the operator has not made
+    visible. ``PortalKbVisibility`` (see its own docstring above) is
+    documented as "the *entire* access-control surface for portal KB
+    access": nothing about a KB is exposed to any portal end-user endpoint
+    unless a row exists there with ``enabled=True``. If bundle creation
+    were allowed to reference an arbitrary core ``kb_id`` unchecked, an
+    operator (or a bug in the bundle admin route) could hand every end user
+    who selects that bundle silent access to a corpus never whitelisted,
+    defeating Phase 3's whole model in one step. So: ``kb_ids_json`` MUST
+    be validated against ``PortalKbVisibility`` (``enabled=True`` rows
+    only) in two places -- (1) at bundle create/update time in
+    ``agent_bundle_service.py``, rejecting any id not currently visible,
+    and (2) again at bundle-apply time per the dangling-reference note
+    above, since visibility can be revoked after the bundle was saved.
+    Belt-and-suspenders on purpose: (1) gives the admin an immediate error
+    instead of a silently-truncated bundle; (2) is what actually keeps the
+    invariant true for bundles that were valid when saved but have since
+    drifted.
+
+    **Which of the two persona/provider binding surfaces this bundle uses,
+    and why:** core exposes two places a session's effective persona/
+    provider can be pinned (see ``PersonaManager.resolve_selected_persona``
+    and ``ProviderManager.get_using_provider``). This bundle's
+    ``persona_id`` is applied via ``conv_mgr.update_conversation(
+    persona_id=...)`` -- the conversation's own persona, which
+    ``resolve_selected_persona`` only falls back to when no
+    ``session_service_config["persona_id"]`` (a *different*, force-applied
+    slot) is set for that umo. This bundle's ``chat_provider_id`` is
+    applied via the per-umo ``sp`` preference key
+    ``provider_perf_chat_completion`` (``scope="umo"``), which
+    ``get_using_provider`` checks *first*, before the operator's own
+    ``default_provider_id``. These are deliberately not symmetric, and that
+    asymmetry is a known, currently-open gap rather than an oversight: a
+    data-scope caller writing ``session_service_config`` through core's own
+    ``POST /api/v1/sessions/rules`` route can still force a persona that
+    shadows this bundle's ``persona_id`` choice, the same class of bypass
+    Phase 3 closed for ``kb_config`` via ``session_rule_guard.py``. Closing
+    it for ``session_service_config`` (claiming it in that guard, with a
+    ``reset`` that removes only the ``persona_id`` sub-key -- never the
+    whole dict, since ``llm_enabled``/``tts_enabled`` live there too -- so
+    the bundle's ``conv_mgr`` fallback becomes visible again) is
+    ``session_rule_guard.py``'s job, not this file's; this docstring
+    records the decision so whoever extends that guard does not have to
+    re-derive it.
+
+    Nullable/defaulted throughout (see class-level field docs) so
+    ``engine.py``'s ``_add_missing_columns`` can reconcile this table onto
+    an already-created database as fields are added in later iterations.
+    """
+
+    __tablename__ = "portal_agent_bundles"  # type: ignore
+
+    bundle_id: str = Field(
+        primary_key=True,
+        max_length=36,
+        default_factory=lambda: str(uuid.uuid4()),
+    )
+    name: str = Field(max_length=100, nullable=False)
+    """Consumer-facing display name shown in the end-user bundle picker
+    (e.g. "Friendly Assistant", "Technical Support"). Never a persona name
+    or provider id -- those are never shown to the client at all."""
+    description: str | None = Field(default=None, max_length=1000)
+    """Optional consumer-facing description of what this bundle is for,
+    shown alongside ``name`` in the picker so a user can decide which
+    bundle to select without any operator-internal context (persona
+    prompt, provider identity) ever reaching the client."""
+
+    persona_id: str | None = Field(default=None, max_length=100)
+    """The persona this bundle applies, matched by value against
+    ``PersonaManager.personas_v3[*]["name"]`` -- see class docstring for
+    the exact binding surface (``conv_mgr.update_conversation``) and the
+    dangling-reference behaviour if the operator deletes it later.
+    Nullable: ``None`` means this bundle does not touch persona at all,
+    leaving whatever persona the conversation already had in effect (e.g.
+    a bundle that exists only to switch the provider for cost/latency
+    reasons). This is a per-field, finer-grained instance of the module's
+    overall default-closed principle: a bundle silent on one dimension
+    changes nothing on that dimension, rather than forcing an implicit
+    value."""
+    chat_provider_id: str | None = Field(default=None, max_length=100)
+    """The chat-completion provider this bundle applies, matched by value
+    against ``ProviderManager.inst_map`` keys. Deliberately only the chat
+    provider -- the plan scopes this phase to persona+provider+KB, not a
+    per-bundle STT/TTS/embedding/rerank override; those keep using the
+    operator's global defaults regardless of which bundle is selected.
+    Applied via the per-umo ``provider_perf_chat_completion`` ``sp`` key
+    (see class docstring) -- this is the mechanism the ground truth
+    confirms keeps Phase 1's "client never supplies a provider" invariant
+    intact, since it is the server, not the client, writing this
+    preference, and only after resolving it from this column. Nullable:
+    ``None`` means this bundle does not set a provider preference, leaving
+    ``get_using_provider`` to fall through to the operator's own
+    ``default_provider_id`` -- i.e. the safe, default-closed behaviour for
+    this dimension is simply not writing the per-umo key at all, not
+    writing some sentinel value."""
+    kb_ids_json: str = Field(default="[]", nullable=False)
+    """JSON-encoded list of ``PortalKbVisibility.kb_id`` strings this
+    bundle binds (e.g. ``'["kb-abc", "kb-def"]'``), stored as plain text
+    rather than a native column type since SQLite has no first-class JSON
+    column and this module has no other precedent for one (see class
+    docstring for the two-point whitelist validation this list must pass
+    both at write time and at every apply time). Defaults to ``"[]"``
+    (an explicit empty list, JSON-decoded) rather than ``NULL`` so callers
+    never need a null-check before ``json.loads`` -- consistent with this
+    module's existing convention (``PortalKbVisibility``'s whole reason
+    for existing is that an explicit empty ``kb_ids`` is a meaningful,
+    different state from "unset"; the same convention is reused here
+    rather than invented twice). Bound to the same
+    ``PortalSettings.max_kb_ids_per_session`` ceiling (``config.py``) at
+    apply time as any other KB-binding path -- deliberately not a second,
+    independent cap, since the retrieval-latency/context-cost rationale
+    behind that ceiling applies identically regardless of whether the
+    KBs arrived at a session via the direct bind route or via a bundle."""
+
+    enabled: bool = Field(default=True, nullable=False)
+    """Whether this bundle is currently selectable by end users. A flag
+    rather than a delete, mirroring ``PortalKbVisibility.enabled``, so
+    disabling a bundle preserves it (and any audit trail) for sessions that
+    already selected it in the past to keep resolving consistently, while
+    removing it from the picker for new selections."""
+    sort_order: int = Field(default=0, nullable=False)
+    """Ascending sort key for the end-user bundle picker's display order.
+    Purely a presentation concern with no authorization meaning -- an
+    admin reordering bundles cannot grant or revoke access to anything."""
+    is_default: bool = Field(default=False, nullable=False)
+    """UI-only "recommended/pre-highlighted" hint for the picker (e.g. the
+    bundle shown first or pre-selected in the widget before the user has
+    chosen anything). This is deliberately NOT a server-side auto-bind
+    marker: a session with no bundle explicitly selected by the user
+    still has no ``bundle_id`` bound anywhere, and every resolution path
+    (persona, provider, KB) falls through to the operator's own configured
+    defaults exactly as if this column did not exist -- per the module's
+    default-closed principle, "an admin marked bundle X as recommended"
+    must never be conflated with "the server picked bundle X for you".
+    Not enforced unique at the database level (SQLAlchemy/SQLite would
+    need a partial/filtered unique index for that); at most one row having
+    ``is_default=True`` is a convention the admin bundle-management route
+    is expected to maintain, not a constraint this table enforces."""
+    updated_by: str | None = Field(default=None, max_length=255)
+    """The operator identity that (most recently) created/updated this
+    bundle, sourced from the admin route's ``AuthContext.username``
+    (``astrbot/dashboard/api/auth.py``'s ``require_system_scope``
+    dependency) at write time -- a plain string, not a foreign key, for
+    the same reason ``PortalKbVisibility.granted_by`` is: dashboard admin
+    identities are not rows in this module's own tables. Nullable and
+    informational/audit-only, never used in an authorization decision."""
+
     created_at: datetime = Field(default_factory=_utcnow, nullable=False)
     updated_at: datetime = Field(
         default_factory=_utcnow,

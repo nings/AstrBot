@@ -278,6 +278,63 @@ class PortalSettings:
     broader search on one question, without allowing an unbounded value.
     """
 
+    # --- Agent Bundle policy (Phase 4: user-selectable persona+provider+KB
+    # presets) ---------------------------------------------------------------
+    #
+    # `PortalAgentBundle` (db/models.py) is the *only* thing an end user ever
+    # names when "choosing an agent" -- never a persona id, never a provider
+    # id, never a raw kb_id. This section is the policy layer around that:
+    # whether the whole feature is reachable at all, plus the one behavioural
+    # question the design doc calls out explicitly -- what happens when a
+    # session has no bundle bound. The answer is deliberately *not* a config
+    # flag: a session with no `bundle_id` selected must resolve exactly as if
+    # this feature did not exist at all (operator's `default_provider_id`,
+    # the conversation's existing persona, no KB), which the two binding
+    # surfaces below (`provider_perf_chat_completion` / `conv_mgr`'s own
+    # persona field) already do on their own the moment nothing writes to
+    # them -- see `PortalAgentBundle`'s docstring for the field-by-field
+    # justification. Making "no bundle bound behaves like the operator's
+    # default" itself togglable would be a foot-gun (an operator could not
+    # accidentally disable the one behaviour rule 7 requires), so it is not
+    # a setting here, only documented as an invariant every caller of this
+    # phase's service/route layer must preserve.
+    agent_bundle_selection_enabled: bool = True
+    """Whether end users may see/select any Agent Bundle at all.
+
+    Mirrors `kb_selection_enabled`'s shape and rationale exactly: defaults on
+    since Phase 4 assumes a deployment that wants the feature, but an
+    operator who wants every end user locked to their own single configured
+    persona/provider/KB combination -- "an operator may not want end users
+    choosing anything" -- must be able to turn the entire surface off with
+    one flag. When `False`, the bundle list/select routes should refuse the
+    request outright (this module's own choice, not a core one) rather than
+    returning an empty bundle list, so the feature reads as verifiably inert
+    rather than quietly empty -- exactly the same reasoning already applied
+    to `kb_selection_enabled` above, reused here rather than re-litigated.
+    Turning this off has no effect on sessions that already have a
+    `bundle_id` bound from before it was disabled; it only gates whether a
+    *new* selection can be made, since retroactively un-applying a bundle's
+    already-written persona/provider preference is a distinct, separate
+    operation (clearing the binding), not a read-time policy check.
+    """
+
+    max_kb_ids_per_bundle: int = max_kb_ids_per_session
+    """Maximum number of distinct `kb_id`s a single `PortalAgentBundle` row
+    may bind, enforced by `agent_bundle_service.py` at bundle create/update
+    time.
+
+    Deliberately reuses `max_kb_ids_per_session`'s value rather than
+    introducing a second, independent ceiling: the retrieval-latency/
+    context-cost rationale documented on `max_kb_ids_per_session` applies
+    identically no matter which path (`kb_routes.py`'s direct per-session
+    bind, or a bundle's KBs applied at selection time) put those KBs into a
+    session's `kb_config` -- the fan-out cost to `kb_mgr.retrieve` is the
+    same either way. Expressed as a reference to the other field (evaluated
+    once, at class-body time, same as every other literal default in this
+    dataclass) instead of a hand-copied literal so the two can never drift
+    out of sync if one is tuned later without remembering the other.
+    """
+
 
 DEFAULT_PORTAL_SETTINGS = PortalSettings()
 
