@@ -72,6 +72,7 @@ dependencies = [
 [dependency-groups]
 dev = [
   "commitizen>=4.9.1",
+  "import-linter>=2.5",
   "pytest>=8.4.1",
   "pytest-asyncio>=1.1.0",
   "pytest-cov>=6.2.1",
@@ -131,3 +132,55 @@ path = "scripts/hatch_build.py"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# ---------------------------------------------------------------------------
+# webui capability-wall enforcement (see design/webui-multiuser-plan.md
+# section 4). These contracts turn the "only core_facade.py may reach the core
+# dashboard/services/persistence internals" convention into a CI-enforced guarantee.
+# ---------------------------------------------------------------------------
+[tool.importlinter]
+root_packages = ["astrbot"]
+
+[[tool.importlinter.contracts]]
+name = "webui capability wall: only core_facade may import chat_service/conversation_mgr/persona_mgr"
+type = "forbidden"
+source_modules = ["astrbot.webui"]
+forbidden_modules = [
+  "astrbot.dashboard.services.chat_service",
+  "astrbot.core.conversation_mgr",
+  "astrbot.core.persona_mgr",
+]
+# NOTE: astrbot.core.utils.shared_preferences deliberately is NOT listed here.
+# astrbot/core/utils/ has no __init__.py (it is an implicit namespace package,
+# as is astrbot/core/agent/), so grimp -- import-linter's module grapher --
+# indexes zero modules under that prefix and the entry would silently pass
+# without ever being checked. Adding an __init__.py purely to satisfy the
+# linter would be a third core intrusion against repo convention, so that one
+# boundary is enforced by tests/test_webui_capability_wall.py instead.
+ignore_imports = [
+  "astrbot.webui.services.core_facade -> astrbot.dashboard.services.chat_service",
+]
+# Direct imports only: astrbot/core/__init__.py itself imports shared_preferences
+# (for its module-level `sp` singleton) and chat_service pulls in core_lifecycle
+# for unrelated wiring -- transitive/indirect checking would flag every webui
+# file that merely does `from astrbot.core import logger`, which is not what
+# this contract is guarding against. We care whether webui code *directly*
+# reaches these modules.
+allow_indirect_imports = "True"
+
+[[tool.importlinter.contracts]]
+name = "webui must never import conversation_service/session_management_service/api_key_service/subagent_orchestrator"
+type = "forbidden"
+source_modules = ["astrbot.webui"]
+forbidden_modules = [
+  "astrbot.dashboard.services.conversation_service",
+  "astrbot.dashboard.services.session_management_service",
+  "astrbot.dashboard.services.api_key_service",
+  "astrbot.core.subagent_orchestrator",
+]
+# Same rationale as above: astrbot.webui.services.core_facade -> chat_service ->
+# core_lifecycle -> subagent_orchestrator is an incidental transitive module
+# load (core_lifecycle wires up the orchestrator for the core runtime; webui
+# code never touches the imported symbol), not a capability-wall breach. Direct
+# imports are what must never happen.
+allow_indirect_imports = "True"
