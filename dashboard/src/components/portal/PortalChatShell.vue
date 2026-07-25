@@ -22,12 +22,21 @@
       <template v-else>
         <div class="chat-header">
           <span class="chat-title">{{ activeSessionTitle || "新会话" }}</span>
-          <KbSelector
-            :key="activeSessionId"
-            class="chat-header-kb-selector"
-            :session-id="activeSessionId ?? ''"
-            :disabled="isGenerating"
-          />
+          <div class="chat-header-controls">
+            <AgentBundlePicker
+              :key="activeSessionId"
+              class="chat-header-bundle-picker"
+              :session-id="activeSessionId ?? ''"
+              :disabled="isGenerating"
+              @switched="onBundleSwitched"
+            />
+            <KbSelector
+              :key="activeSessionId"
+              class="chat-header-kb-selector"
+              :session-id="activeSessionId ?? ''"
+              :disabled="isGenerating"
+            />
+          </div>
         </div>
 
         <div v-if="resumeNotice" class="banner banner-warning">
@@ -44,12 +53,30 @@
           </div>
 
           <div v-else class="chat-messages">
-            <div
+            <template
               v-for="(msg, msgIndex) in messages"
               :key="msg.id ?? `${msgIndex}-${msg.created_at || ''}`"
-              class="message-row"
-              :class="isUserMessage(msg) ? 'from-user' : 'from-bot'"
             >
+              <!--
+                Agent-bundle switch marker (Phase 4): a client-side-only,
+                never-persisted divider row inserted by `onBundleSwitched`
+                below, making a mid-conversation preset change legible in
+                the thread rather than silently swapping the persona/
+                provider under later turns -- see that function's own
+                comment for the chosen treatment and why it is ephemeral
+                (not saved server-side, so it does not survive a session
+                reload; this is a deliberate, documented trade-off, not an
+                oversight).
+              -->
+              <div v-if="isBundleSwitchMarker(msg)" class="bundle-switch-marker">
+                <v-icon size="14">mdi-swap-horizontal</v-icon>
+                <span>{{ msg.sender_name }}</span>
+              </div>
+              <div
+                v-else
+                class="message-row"
+                :class="isUserMessage(msg) ? 'from-user' : 'from-bot'"
+              >
               <v-avatar v-if="!isUserMessage(msg)" class="bot-avatar" size="36">
                 <v-progress-circular
                   v-if="isMessageStreaming(msgIndex)"
@@ -192,7 +219,8 @@
                   </div>
                 </div>
               </div>
-            </div>
+              </div>
+            </template>
           </div>
         </div>
 
@@ -335,10 +363,21 @@ import {
   type MessagePart,
 } from "@/composables/useMessages";
 import { copyToClipboard } from "@/utils/clipboard";
+import { useModuleI18n } from "@/i18n/composables";
 import PortalSessionList from "@/components/portal/PortalSessionList.vue";
 import PortalComposer from "@/components/portal/PortalComposer.vue";
 import PortalAttachment from "@/components/portal/PortalAttachment.vue";
 import KbSelector from "@/components/portal/KbSelector.vue";
+import AgentBundlePicker from "@/components/portal/AgentBundlePicker.vue";
+
+// Only used for the two agent-bundle-switch marker strings below
+// (`onBundleSwitched`) -- see that function's own comment for why this is
+// the one piece of genuinely new, bilingual-facing content added to this
+// file, as opposed to this file's many pre-existing hardcoded Chinese UI
+// strings, which are left exactly as they were (out of scope for this
+// phase; not touched here to keep this diff to what the assignment
+// actually asked for).
+const { tm: t } = useModuleI18n("features/auth");
 
 registerPortalChatMarkdownComponents();
 
@@ -706,6 +745,19 @@ function isUserMessage(message: ChatRecord) {
   return messageContent(message).type === "user";
 }
 
+// Agent-bundle switch marker (Phase 4): a plain `ChatRecord` whose
+// `content.type` is the sentinel `"bundle_switch"` rather than `"user"`/
+// `"bot"`. `ChatContent.type` is typed `"user" | "bot" | string`
+// (`useMessages.ts`), so this is a legitimate, type-safe value of that
+// field -- no new exported type or edit to that shared, not-owned file is
+// needed. See `onBundleSwitched` below for where these are created; they
+// are never sent to the server and never appear in `payload.history` on
+// reload (this file's own `normalizeHistoryRecord` only ever runs over
+// what the server actually persisted).
+function isBundleSwitchMarker(message: ChatRecord) {
+  return messageContent(message).type === "bundle_switch";
+}
+
 function renderBlocks(message: ChatRecord): MessageDisplayBlock[] {
   if (isUserMessage(message)) {
     const parts = messageContent(message).message || [];
@@ -903,6 +955,56 @@ function onSessionDeleted(sessionId: string) {
 
 function onSessionRenamed(sessionId: string, displayName: string) {
   if (activeSessionId.value === sessionId) activeSessionTitle.value = displayName;
+}
+
+/**
+ * Handles `AgentBundlePicker.vue`'s `@switched` event -- fired only after a
+ * bind/unbind has actually succeeded server-side (see that component's own
+ * comment), never speculatively.
+ *
+ * Chosen treatment for "make a mid-conversation preset switch legible in
+ * the thread rather than silently swapping" (this phase's own explicit
+ * product question): insert a small, centered, non-message divider row
+ * into `messages` announcing the change, styled and behaving like a
+ * lightweight system note rather than a chat bubble from either party --
+ * never attributed to "user" or "bot" (earlier turns really were produced
+ * under the previous persona/provider; a later assistant bubble claiming
+ * credit for a switch it didn't make would misrepresent that).
+ *
+ * Deliberately client-side-only, not persisted: there is no server-side
+ * concept of a "bundle switch event" message in `chat_service.py`'s own
+ * history model, and inventing one would mean either extending a core file
+ * this phase must not touch, or writing a portal-only shadow log that the
+ * reused `normalizeHistoryRecord`/history-loading path would then also
+ * need to merge back in on every reload -- disproportionate for what is,
+ * in the end, a presentational cue. The trade-off this accepts: the marker
+ * does not survive a page reload or a session-list re-selection (a fresh
+ * `loadSession` call only ever replays `payload.history`, which never
+ * contained it). What *does* persist correctly regardless is the actual
+ * effect of the switch -- the newly bound persona/provider/KB config,
+ * which core resolves on every subsequent turn from the session's own
+ * bookkeeping, not from anything in this file's local `messages` array.
+ *
+ * Only inserted when the thread already has at least one message: with an
+ * empty thread there are no earlier turns for the switch to visually
+ * contrast against, so a marker would just be clutter above the first
+ * message ever sent.
+ */
+function onBundleSwitched(bundle: { bundle_id: string; name: string } | null) {
+  if (!activeSessionId.value || messages.value.length === 0) return;
+  const label = bundle
+    ? String(t("portal.agentBundle.switchedTo", { name: bundle.name }))
+    : String(t("portal.agentBundle.switchedToDefault"));
+  messages.value = [
+    ...messages.value,
+    {
+      id: `bundle-switch-${Date.now()}`,
+      created_at: new Date().toISOString(),
+      sender_name: label,
+      content: { type: "bundle_switch", message: [] },
+    },
+  ];
+  scrollToBottomSoon();
 }
 
 async function selectSession(sessionId: string, label: string | null) {
@@ -1266,8 +1368,32 @@ async function regenerateLast() {
   font-weight: 600;
 }
 
+.chat-header-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.chat-header-bundle-picker,
 .chat-header-kb-selector {
   flex-shrink: 0;
+}
+
+.bundle-switch-marker {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: fit-content;
+  max-width: 90%;
+  margin: 0 auto;
+  padding: 4px 14px;
+  border-radius: 999px;
+  background: rgba(var(--v-theme-on-surface), 0.06);
+  color: var(--chat-muted);
+  font-size: 12px;
+  text-align: center;
 }
 
 .chat-scroll {
