@@ -193,10 +193,15 @@ def test_shared_preferences_put_async_signature():
 
 
 def test_core_facade_module_exports_unchanged():
+    # Phase 2 intentionally grew this list (attachment-ownership verification
+    # hook + upload/discard/resolve facade wrappers). Pinned to the current,
+    # deliberate Phase 2 export surface -- update again only for a similarly
+    # deliberate future export change, not silently.
     assert core_facade.__all__ == [
         "CoreFacadeError",
         "ResourceNotFoundError",
         "ValidationError",
+        "AttachmentOwnershipVerifier",
         "get_jwt_secret",
         "create_session",
         "list_sessions",
@@ -210,5 +215,8 @@ def test_core_facade_module_exports_unchanged():
         "stop_run",
         "update_message",
         "regenerate",
+        "save_upload",
+        "discard_orphaned_upload",
+        "resolve_attachment",
         "get_chat_configs",
     ]
