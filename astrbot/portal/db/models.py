@@ -18,7 +18,8 @@ columns. Only ``user_id`` foreign keys *within this module's own tables*
 (``PortalSession.user_id`` -> ``PortalUser.user_id``,
 ``PortalOAuthIdentity.user_id`` -> ``PortalUser.user_id``,
 ``PortalUsageCounter.user_id`` -> ``PortalUser.user_id``,
-``PortalAttachmentOwner.user_id`` -> ``PortalUser.user_id``) are declared,
+``PortalAttachmentOwner.user_id`` -> ``PortalUser.user_id``,
+``PortalInvite.user_id`` -> ``PortalUser.user_id``) are declared,
 since those are safe same-database, same-metadata relationships.
 
 ``PortalAttachmentOwner``, ``PortalKbVisibility`` and ``PortalAgentBundle``
@@ -169,6 +170,215 @@ class PortalOAuthIdentity(PortalBaseModel, table=True):
             name="uix_portal_oauth_provider_subject",
         ),
     )
+
+
+class PortalInvite(PortalBaseModel, table=True):
+    """Phase 5a admin-provisioned-account invite: a one-time link an operator
+    generates and delivers **out-of-band** (there is no mail infrastructure
+    anywhere in this repo -- no ``smtplib``/``aiosmtplib`` usage exists --
+    so this table only ever produces a link; the operator UI that creates a
+    row here must make the "you paste/send this link yourself" hand-off
+    explicit rather than implying an email was sent).
+
+    **Design decision -- pre-create the ``PortalUser`` row, don't defer it
+    to redemption.** ``PortalUser.status`` has carried ``'invited'`` in its
+    documented vocabulary since Phase 1 specifically for this: creating a
+    ``PortalUser`` row (``status='invited'``, ``auth_method='invited'``,
+    ``password_hash=None``) at the moment the operator issues the invite,
+    rather than deferring account creation to the moment the invitee clicks
+    the link. This is deliberately chosen over the alternative
+    (create-user-only-on-redemption) for two reasons: (1) it claims the
+    target email's uniqueness (``PortalUser.email`` is
+    ``unique=True``) immediately, so a second operator (or the
+    self-registration endpoint, if ``PortalSettings.self_registration_open``
+    is ever re-enabled for a deployment that also uses invites) cannot land
+    a second, colliding account for the same address in the gap between
+    "operator clicked create" and "invitee clicked the link"; (2) it gives
+    the invite-creation route a real row to attach ``user_id`` to via an
+    actual ``ForeignKey`` (this table's own within-module FK rule, see
+    module docstring) instead of a value-only reference resolved at
+    redemption time.
+
+    **Why this cannot leave an unusable half-account behind.** The concern
+    the assignment calls out is specifically about a *failed redemption*
+    leaving broken state -- it is not about an invite that simply expires
+    unused (that is not a failure, it is this table's normal resting
+    state, exactly as intentional as an unconfirmed self-registration would
+    be). Two separate guarantees:
+
+    * *Redemption itself is one DB transaction.* The service that redeems
+      an invite must, in a single commit, both (a) set this row's
+      ``consumed_at`` and (b) update the referenced ``PortalUser`` row
+      (``password_hash``, ``status='active'``) -- never two separate
+      commits. SQLite's transaction atomicity then makes "consumed but
+      user still ``status='invited'`` with no password" (or the reverse)
+      impossible: either both writes land, or neither does and the invite
+      remains exactly as re-triable as it was before the attempt.
+    * *An invite that expires (or is revoked) before anyone redeems it*
+      leaves the ``PortalUser`` row sitting at ``status='invited'``,
+      ``password_hash=None`` -- indistinguishable from "never got around
+      to it yet", not a broken state: that account cannot authenticate via
+      any path (no password to check, not ``'active'``, no OAuth identity
+      bound), so it is inert, not "half". Recovery does not require
+      touching ``PortalUser`` at all: an operator re-invites the same
+      address by creating a **new** ``PortalInvite`` row against the
+      *same* ``user_id`` (this table intentionally has no
+      one-row-per-user uniqueness constraint, precisely so reissuing a
+      fresh token/expiry for an already-pre-created invited user is just
+      another insert here, not a user-table repair). Whoever builds the
+      admin invite-creation route should therefore check for an existing
+      ``status='invited'`` ``PortalUser`` with the requested email first
+      and, if found, issue a new ``PortalInvite`` against that same
+      ``user_id`` instead of trying (and uniqueness-failing) to create a
+      second ``PortalUser`` row.
+
+    **Token shape -- mirrors ``PortalSession``'s refresh-token pattern
+    exactly, on purpose.** ``invite_id`` (this row's primary key) is the
+    public half embedded directly in the link; ``token_hash`` is a PBKDF2
+    hash (reuse ``astrbot.portal.auth.security``'s existing
+    ``hash_refresh_secret``/``verify_refresh_secret`` -- themselves thin
+    wrappers over ``astrbot.core.utils.auth_password``'s
+    ``hash_dashboard_password``/``verify_dashboard_password`` -- rather
+    than inventing a third hashing call site) of an opaque, independently
+    generated secret (``generate_refresh_secret()`` is equally suitable
+    here; it is not refresh-specific despite the name -- it is just
+    ``secrets.token_urlsafe(32)``). The link the operator copies is the
+    two halves joined exactly the way
+    ``encode_refresh_token``/``decode_refresh_token`` already do it
+    (``f"{invite_id}.{secret}"``), so redemption looks the row up by
+    primary key (O(1)) instead of scanning every live invite's individually
+    salted PBKDF2 hash -- never store the raw secret itself, only its hash,
+    for the same reason a refresh token secret is never stored raw.
+
+    **Verification order -- this is what makes "was this already used"
+    answerable without turning the invite_id space into an enumeration
+    oracle.** The redeeming service must, in this exact order:
+
+    1. Split the presented token into ``(invite_id, secret)``. Look up the
+       row by ``invite_id`` (the primary key).
+    2. If no row exists **or** ``verify_refresh_secret(token_hash,
+       secret)`` fails, return the *same* generic "invalid" response
+       either way -- a missing ``invite_id`` and a wrong secret for a real
+       ``invite_id`` must be indistinguishable to the caller, otherwise the
+       invite_id namespace itself becomes something an attacker can probe.
+    3. **Only once the secret has verified** against a real row's
+       ``token_hash`` -- i.e. only for someone who already possesses the
+       correct, unguessable token -- is it safe to distinguish further
+       states and return a more specific status: ``consumed_at is not
+       None`` -> "already used" (the assignment's status distinct from
+       expiry, e.g. 410); ``revoked_at is not None`` -> "revoked"; else
+       ``expires_at <= now`` -> "expired"; else the invite is live and
+       redemption may proceed. Distinguishing these three *after* secret
+       verification leaks nothing to anyone who does not already hold the
+       token, since holding the correct secret is itself proof the caller
+       received this exact link from the operator.
+
+    **Email binding.** ``target_email`` is a snapshot of the invited
+    ``PortalUser.email`` at issuance time, not merely informational: the
+    redeeming service must re-check that the referenced ``PortalUser``'s
+    *current* ``email`` still equals this snapshot before honoring
+    redemption, and refuse (fail closed) if they have diverged (e.g. some
+    other admin path edited the user's email between invite creation and
+    redemption). The redemption flow itself must never let the invitee
+    change the email as part of accepting the invite -- only
+    ``display_name``/password are theirs to set -- since allowing an email
+    change during redemption would turn a leaked or guessed link into a way
+    to redirect an account to an attacker-controlled address (rule 5:
+    account identity binding is the takeover surface to guard here, same
+    family of concern as SSO-email account linking).
+
+    Nullable/defaulted throughout the audit-trail tail (``revoked_at``/
+    ``revoked_by``) so ``engine.py``'s ``_add_missing_columns`` can
+    reconcile this table if those two fields are ever added after initial
+    rollout, matching every other table in this module.
+    """
+
+    __tablename__ = "portal_invites"  # type: ignore
+
+    invite_id: str = Field(
+        primary_key=True,
+        max_length=36,
+        default_factory=lambda: str(uuid.uuid4()),
+    )
+    """Public half of the one-time link (``.../invite/accept?token=<invite_id>.<secret>``).
+    Looked up by primary key first, before the secret is ever checked -- see
+    class docstring's "verification order" for why that sequencing matters."""
+
+    token_hash: str = Field(max_length=255, nullable=False)
+    """PBKDF2 hash (via ``astrbot.portal.auth.security.hash_refresh_secret``)
+    of the opaque secret half. Never store the raw secret -- exactly the
+    same rule ``PortalSession.refresh_token_hash`` follows, for the same
+    reason (a DB read/leak must not hand out a usable credential)."""
+
+    user_id: str = Field(
+        foreign_key="portal_users.user_id",
+        max_length=36,
+        nullable=False,
+        index=True,
+    )
+    """The pre-created ``PortalUser`` (``status='invited'``) this invite
+    activates on redemption. A real ``ForeignKey`` since both tables share
+    this module's own database/metadata (unlike the value-only associations
+    into core's separate database files documented elsewhere in this
+    module). Indexed for the "does an invited user already exist for this
+    email" reissue-lookup path described in the class docstring, and for
+    "list this user's invite history" admin tooling."""
+
+    target_email: str = Field(max_length=255, nullable=False, index=True)
+    """Snapshot of ``PortalUser.email`` at the moment this invite was
+    issued. Binding, not decorative -- see class docstring's "email
+    binding" section for the re-check redemption must perform and why the
+    invitee must never be allowed to change it as part of accepting the
+    invite. Indexed for an admin "find outstanding invites for this
+    address" lookup without joining through ``PortalUser``."""
+
+    created_by: str = Field(max_length=255, nullable=False)
+    """The operator identity that created this invite, sourced from the
+    admin route's ``AuthContext.username`` (``astrbot/dashboard/api/auth.py``'s
+    ``require_system_scope`` dependency, imported verbatim at the route
+    layer -- never re-derived here) at write time. A plain string, not a
+    foreign key, for the same reason ``PortalKbVisibility.granted_by`` and
+    ``PortalAgentBundle.updated_by`` are: dashboard admin identities are not
+    rows in this module's own tables; the two identity systems are
+    independent by design (Phase 1 capability-wall notes). Unlike those two
+    audit-only columns, this one also participates in access control
+    indirectly -- it is how "which operator is responsible for this
+    provisioned account" stays answerable -- but it is still never itself
+    checked as an authorization condition; ``require_system_scope`` at the
+    route layer is what already gated invite creation."""
+
+    created_at: datetime = Field(default_factory=_utcnow, nullable=False)
+
+    expires_at: datetime = Field(nullable=False)
+    """Invite TTL boundary (see ``PortalSettings.invite_token_ttl_seconds``
+    for the default the creating route should apply). Checked only after
+    secret verification succeeds -- see class docstring's verification
+    order."""
+
+    consumed_at: datetime | None = Field(default=None)
+    """Explicit single-use marker **and** timestamp in one column, mirroring
+    ``PortalSession.revoked_at``'s exact same double duty in this same
+    file: ``None`` means unused, a timestamp means consumed at that instant.
+    Set in the same transaction as the redeemed ``PortalUser``'s activation
+    (see class docstring's transaction-atomicity guarantee) -- never set
+    speculatively before that update is known to succeed."""
+
+    revoked_at: datetime | None = Field(default=None)
+    """Operator-initiated cancellation of an outstanding, not-yet-redeemed
+    invite (e.g. the operator typed the wrong email and wants the link
+    dead before anyone can use it), independent of expiry/consumption.
+    Mirrors ``PortalKbVisibility.enabled``/``PortalAgentBundle.enabled``'s
+    "flag rather than delete" convention -- kept as a flag so the audit
+    trail (who created it, when, for whom) survives cancellation instead of
+    being lost. Never set by the redemption path itself, only by an admin
+    cancel action."""
+
+    revoked_by: str | None = Field(default=None, max_length=255)
+    """The operator identity that revoked this invite (see ``created_by``
+    for why this is a plain string, not a foreign key). Nullable and
+    audit-only, following ``_add_missing_columns``'s reconciliation
+    convention for a column that may be absent on an already-created
+    database."""
 
 
 class PortalUsageCounter(PortalBaseModel, table=True):

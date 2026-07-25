@@ -54,6 +54,42 @@ PORTAL_REFRESH_COOKIE_NAME = "astrbot_portal_refresh"
 PORTAL_CSRF_COOKIE_NAME = "astrbot_portal_csrf"
 PORTAL_CSRF_HEADER_NAME = "X-Portal-CSRF-Token"
 
+# ---------------------------------------------------------------------------
+# SSO provider identifiers (Phase 5). These are the exact strings written into
+# ``PortalOAuthIdentity.provider`` (db/models.py, max_length=50 -- trivially
+# large enough) and the exact strings ``PortalSettings.sso_enabled_providers``
+# below is validated against. Three providers, three genuinely different
+# trust models -- see each provider's settings section further down and
+# ``astrbot/portal/auth/security.py``'s (or its Phase 5 successor's) per-adapter
+# docstrings for why they cannot share one verification code path:
+#
+# * ``SSO_PROVIDER_OIDC`` -- generic OpenID Connect (Google, Microsoft Entra,
+#   Keycloak, Authentik, Auth0, ...). Trust rests on a cryptographically
+#   signed ``id_token`` verified against the provider's own JWKS
+#   (``jwt.PyJWKClient``) -- signature, ``iss``, ``aud``, ``exp``, ``nonce``.
+# * ``SSO_PROVIDER_WECOM`` -- WeCom (企业微信) via ``wechatpy.enterprise``/
+#   ``wechatpy.oauth``. No signed assertion at all: the callback code is
+#   exchanged for identity via an authenticated API call, so trust rests
+#   entirely on the confidentiality of ``wecom_app_secret`` and the response
+#   genuinely being for this app -- never treat this the same way as a
+#   verified OIDC token.
+# * ``SSO_PROVIDER_FEISHU`` -- Feishu (飞书) via ``lark_oapi``'s ``authen``
+#   API module. Same non-cryptographic trust shape as WeCom: an API-response
+#   identity gated by ``feishu_app_secret``'s confidentiality, not a
+#   verified signature.
+# ---------------------------------------------------------------------------
+
+SSO_PROVIDER_OIDC = "oidc"
+SSO_PROVIDER_WECOM = "wecom"
+SSO_PROVIDER_FEISHU = "feishu"
+ALL_SSO_PROVIDERS = frozenset({SSO_PROVIDER_OIDC, SSO_PROVIDER_WECOM, SSO_PROVIDER_FEISHU})
+"""The complete, closed set of identity providers in scope for this module.
+Nothing else is supported -- see this phase's engineering decisions. Used
+both to validate ``PortalSettings.sso_enabled_providers`` (fail closed on a
+typo/unknown provider at settings-construction time, rather than silently
+treating it as disabled) and as the canonical key set every
+provider-availability/adapter-dispatch table in this module should iterate."""
+
 
 @dataclass(frozen=True)
 class PortalSettings:
@@ -80,10 +116,38 @@ class PortalSettings:
 
     # --- Registration ---------------------------------------------------
     self_registration_open: bool = True
-    """Whether POST /api/v1/portal/auth/register is enabled (Phase 1 default).
+    """Whether POST /api/v1/portal/auth/register is enabled.
 
-    When an admin disables self-registration (Phase 5a lands
-    admin-provisioned invites), this should be flipped to False.
+    Phase 1 shipped this defaulting to ``True`` (there was no other way to
+    get an account yet) with an explicit forward-looking note that it
+    should flip once admin-provisioned invites existed -- this phase is
+    where that becomes possible. The product question this phase's
+    assignment calls out ("should self-registration stay open once
+    provisioning exists") has a real answer, and it is not "leave it
+    exactly as-is forever": once a deployment configures SSO against a
+    corporate IdP (WeCom/Feishu are both enterprise identity systems, not
+    consumer ones) or starts provisioning specific accounts via invite, it
+    has by construction expressed a preference for a controlled roster,
+    and leaving self-registration on by default would let anyone bypass
+    both provisioning models with a plain email+password signup.
+
+    The default here is left at ``True`` in *this* commit specifically
+    because flipping it breaks two already-passing tests this phase does
+    not own (``tests/test_portal_auth.py::test_login_then_me_succeeds``,
+    ``::test_refresh_replay_revokes_whole_family`` -- both register a user
+    via the open self-registration endpoint as test setup) that this
+    module's engineering rules require to keep passing, and this phase is
+    not permitted to edit test files to accommodate its own config change.
+    This is a deliberate, documented exception to the "pick a default
+    that reflects the product decision" instruction, not an oversight --
+    see this phase's handoff report for the full reasoning. **A deployment
+    that provisions accounts via invite and/or SSO should still set this to
+    ``False``** (it remains a one-line settings override, not a removed
+    capability); whoever next touches ``auth_routes.py``/the test suite for
+    this setting should update the two tests above to explicitly construct
+    their own ``PortalSettings(self_registration_open=True)`` override
+    (rather than relying on the shared default) and only then flip this
+    default to ``False`` for real.
     """
 
     # --- Auth endpoint rate limiting (register/login/refresh) --------------
@@ -335,6 +399,224 @@ class PortalSettings:
     out of sync if one is tuned later without remembering the other.
     """
 
+    # --- Admin-provisioned invites (Phase 5a) --------------------------------
+    invite_token_ttl_seconds: int = 7 * 24 * 60 * 60
+    """TTL for an admin-created ``PortalInvite`` (db/models.py), in seconds:
+    7 days.
+
+    There is no mail infrastructure in this repo (verified: no
+    ``smtplib``/``aiosmtplib`` usage anywhere), so an invite link is always
+    handed to the invitee out-of-band by the operator (chat message,
+    ticket, whatever channel they already use) rather than emailed
+    automatically. Sized accordingly: long enough that the operator does
+    not have to deliver the link the same minute they generate it and the
+    recipient has a realistic window to actually notice and act on it
+    through an arbitrary out-of-band channel, but bounded well short of
+    ``refresh_token_ttl_seconds`` (30 days) so a leaked or forgotten
+    out-of-band message (e.g. a stale ticket) does not stay redeemable
+    indefinitely. An operator who needs a fresher window for an
+    already-issued invite is not stuck waiting this out either way -- see
+    ``PortalInvite``'s docstring for the "reissue against the same
+    pre-created user_id" recovery path, which is just a new row with a
+    fresh expiry, not a wait.
+    """
+
+    # --- SSO / OIDC + WeCom + Feishu (Phase 5b) ------------------------------
+    #
+    # Three providers in scope, three genuinely different credential shapes
+    # (see ``ALL_SSO_PROVIDERS``'s comment above for why they cannot share one
+    # verification code path) -- deliberately kept as flat, provider-prefixed
+    # fields rather than nested per-provider dataclasses, matching this
+    # dataclass's existing flat style everywhere else in this file.
+    #
+    # Secrets note (``oidc_client_secret``/``wecom_app_secret``/
+    # ``feishu_app_secret``): none of these three fields may ever be logged or
+    # echoed back by any endpoint. The only thing a downstream route should
+    # expose to the SPA is *availability* -- see ``get_sso_provider_availability``
+    # below, which returns booleans only and never touches a secret field's
+    # value in doing so. Whoever builds that route should return exactly (and
+    # only) that function's dict, never ``dataclasses.asdict(settings)`` or
+    # any other blanket serialization of this class, which would include the
+    # secret fields verbatim.
+    sso_enabled: bool = False
+    """Master switch for the entire SSO surface. When ``False``, the OAuth
+    start/callback routes must refuse the request outright regardless of any
+    individual provider's fields being populated below -- mirrors this
+    file's existing ``kb_selection_enabled``/``agent_bundle_selection_enabled``
+    "verifiably inert, not quietly empty" convention."""
+
+    sso_enabled_providers: frozenset[str] = frozenset()
+    """Subset of ``ALL_SSO_PROVIDERS`` currently reachable, independent of
+    ``sso_enabled``: both must hold (``sso_enabled and provider in
+    sso_enabled_providers``) for a given provider's start/callback routes to
+    do anything. Validated against ``ALL_SSO_PROVIDERS`` in
+    :meth:`__post_init__` -- an unknown entry (typo, e.g. ``'wecomm'``)
+    raises at settings-construction time (startup) rather than silently
+    behaving as "that provider is disabled", per this module's fail-closed
+    rule: a misconfigured deployment should fail loudly, not quietly narrow
+    its own security surface without telling anyone."""
+
+    sso_redirect_base_url: str | None = None
+    """Base URL the portal SPA is actually served from (e.g.
+    ``https://chat.example.com/portal``), used to construct each provider's
+    callback/redirect URI. Must match the SPA's real serving base exactly --
+    the portal SPA is served at ``/portal`` with hash/history routing under
+    that base (Phase 1 ground truth), and an OIDC/WeCom/Feishu authorize
+    request's redirect_uri must byte-for-byte match what each provider's app
+    registration has on file, or the provider will refuse the callback.
+    Whoever builds the authorize-redirect and callback-verification code
+    must derive the redirect_uri from this single field in both places
+    (e.g. ``f"{sso_redirect_base_url}/oauth/callback/{provider}"``) rather
+    than hand-constructing it twice, so the two can never drift apart.
+    ``None`` (the default) means SSO cannot be started at all, independent
+    of ``sso_enabled`` -- a deployment must explicitly configure where it
+    lives before any provider can be reachable."""
+
+    sso_state_ttl_seconds: int = 10 * 60
+    """How long an OAuth ``state``/``nonce`` pair (CSRF protection for the
+    authorize -> callback round trip) remains valid before the callback must
+    complete: 10 minutes. Short on purpose -- this is a live, in-flight
+    login attempt, not a credential with any reason to be long-lived; a
+    short window minimizes how long a captured (but not yet used) state
+    value stays exploitable while still comfortably covering how long a
+    real user takes to authenticate at the IdP and get redirected back
+    (including a slow corporate SSO/MFA prompt)."""
+
+    # --- Generic OIDC (Google, Microsoft Entra, Keycloak, Authentik, Auth0, ...)
+    oidc_issuer: str | None = None
+    """Issuer URL (e.g. ``https://accounts.google.com``). Configuration
+    should be sourced from this provider's own discovery document
+    (``{issuer}/.well-known/openid-configuration``) at runtime rather than
+    hand-entering the authorize/token/JWKS endpoints separately, per this
+    phase's decision -- ``oidc_discovery_url`` below exists only for the
+    rarer case where a provider's discovery document does not live at the
+    conventional suffix under its issuer."""
+
+    oidc_discovery_url: str | None = None
+    """Explicit override for the OIDC discovery document URL, for a
+    provider whose ``/.well-known/openid-configuration`` is not reachable
+    at the conventional path under ``oidc_issuer``. Leave unset (``None``)
+    to use the conventional suffix; when set, takes precedence over
+    deriving it from ``oidc_issuer``."""
+
+    oidc_client_id: str | None = None
+    """This portal's registered client id with the OIDC provider. Not a
+    secret; safe to expose as part of the (non-secret) authorize-request
+    construction, but still not part of what ``get_sso_provider_availability``
+    returns to the SPA -- the SPA never constructs the authorize URL itself,
+    it only asks "is OIDC available" and is handed a server-built redirect."""
+
+    oidc_client_secret: str | None = None
+    """This portal's client secret for the OIDC token-exchange step. SECRET:
+    never logged, never echoed back by any endpoint, never included in any
+    settings serialization exposed to a route. Used only server-side during
+    the authorization-code-for-token exchange."""
+
+    oidc_scopes: tuple[str, ...] = ("openid", "email", "profile")
+    """Scopes requested in the authorize request, in the exact order they
+    should be joined (space-separated) into the request -- a tuple, not a
+    ``frozenset``, specifically so this ordering is preserved rather than
+    made arbitrary. ``openid`` is load-bearing (it is what makes this an
+    OIDC request rather than a bare OAuth2 one and is what causes the
+    provider to return a signed ``id_token`` at all); ``email``/``profile``
+    are what typically populate the ``email``/``email_verified``/``name``
+    claims this module's identity-linking logic needs."""
+
+    # There is deliberately NO `oidc_require_email_verified` setting here.
+    #
+    # An earlier draft of this module carried one, documented as the
+    # fail-closed gate against binding an SSO identity to a pre-existing local
+    # account by email address. It was dead configuration: nothing read it,
+    # because the takeover it claimed to prevent is closed structurally instead,
+    # and more strongly than a flag could.
+    #
+    # `sso_service` resolves an identity only by `(provider, subject)`, never by
+    # email, and no code path creates a `PortalUser` from an SSO callback at all
+    # -- SSO is a login method for accounts that already exist, not a signup
+    # path. So an identity provider cannot obtain, squat or take over an account
+    # by asserting any email address, verified or not, and there is nothing for
+    # such a setting to gate. See `sso_service`'s module docstring, and
+    # `tests/test_portal_oauth.py::
+    # test_unknown_sso_identity_creates_no_account_and_grants_no_session`, which
+    # pins that property so a later "auto-provision on first SSO login"
+    # convenience cannot remove it silently.
+    #
+    # A security setting that does nothing is worse than no setting: an operator
+    # reading `oidc_require_email_verified = True` reasonably concludes that
+    # email verification is enforced somewhere. It was not. `email_verified` is
+    # still recorded faithfully on `VerifiedIdentity` (and is always False for
+    # providers that have no such concept), so it is available the moment a
+    # feature genuinely needs to branch on it -- at which point the setting can
+    # come back together with the code that reads it.
+
+    # --- WeCom (企业微信) -----------------------------------------------------
+    #
+    # No signed identity assertion exists in this flow at all (unlike OIDC) --
+    # trust rests entirely on ``wecom_app_secret``'s confidentiality and on
+    # the token-exchange response genuinely being for this app. See
+    # ``ALL_SSO_PROVIDERS``'s comment above; whoever implements the adapter
+    # must make this non-cryptographic trust basis explicit in its own
+    # docstring rather than presenting it as equivalent to OIDC verification.
+    #
+    # These credentials are for a *separate* WeCom app registration used only
+    # for portal web login -- deliberately independent of whatever corp app
+    # credentials ``astrbot/core/platform/sources/wecom/`` already holds for
+    # *receiving IM messages*. That existing adapter's credentials must never
+    # be read, reused, or reconfigured from here: conflating a bot's IM
+    # credentials with a web-login app's credentials would mean a compromise
+    # of one channel compromises the other, and the two are not necessarily
+    # even the same corp app in a real deployment.
+    wecom_corp_id: str | None = None
+    """The WeCom enterprise's corp id (``CorpID``) for the app used for
+    portal web login. Not a secret by itself, but only meaningful paired
+    with ``wecom_agent_id``/``wecom_app_secret`` below."""
+
+    wecom_agent_id: str | None = None
+    """The WeCom self-built app's numeric AgentId, represented as ``str``
+    for consistency with every other id field in this config module (plain
+    string settings, no per-field int parsing at the config layer); the
+    adapter that actually calls ``wechatpy.enterprise``/``wechatpy.oauth``
+    is expected to ``int()``-cast this where the SDK requires a real int."""
+
+    wecom_app_secret: str | None = None
+    """The web-login app's secret (``Secret``), used to exchange an OAuth
+    code for this app's own access token before calling WeCom's user-info
+    API. SECRET: never logged, never echoed back by any endpoint. Must be
+    the *login app's* secret, not the IM-receiving bot's secret -- see the
+    section comment above."""
+
+    # --- Feishu (飞书) --------------------------------------------------------
+    #
+    # Same non-cryptographic trust shape as WeCom (see that section's comment
+    # above) -- via ``lark_oapi``'s ``authen`` API module. Same separation
+    # requirement from ``astrbot/core/platform/sources/lark/``'s existing
+    # IM-receiving bot credentials applies identically here.
+    feishu_app_id: str | None = None
+    """The Feishu app id for the app used for portal web login. Not a
+    secret by itself."""
+
+    feishu_app_secret: str | None = None
+    """The web-login app's secret, used to exchange an OAuth code for
+    identity via ``lark_oapi``'s ``authen`` API. SECRET: never logged, never
+    echoed back by any endpoint. Must be a *separate* app registration from
+    whatever ``astrbot/core/platform/sources/lark/`` uses for receiving IM
+    messages -- see the WeCom section comment above for why conflating the
+    two credential sets would be a real defect, not just an untidy
+    shortcut."""
+
+    def __post_init__(self) -> None:
+        """Fail closed on an unknown ``sso_enabled_providers`` entry at
+        settings-construction time (startup), rather than letting a typo
+        silently behave as "that provider is disabled" with no signal to
+        the operator that anything is wrong."""
+        unknown = self.sso_enabled_providers - ALL_SSO_PROVIDERS
+        if unknown:
+            raise ValueError(
+                "PortalSettings.sso_enabled_providers contains unknown "
+                f"provider(s) {sorted(unknown)!r}; must be a subset of "
+                f"{sorted(ALL_SSO_PROVIDERS)!r}"
+            )
+
 
 DEFAULT_PORTAL_SETTINGS = PortalSettings()
 
@@ -347,6 +629,64 @@ def get_portal_settings() -> PortalSettings:
     table) without changing every call site.
     """
     return DEFAULT_PORTAL_SETTINGS
+
+
+# ---------------------------------------------------------------------------
+# SSO provider *availability* -- the one thing safe to expose to the SPA.
+# ---------------------------------------------------------------------------
+
+
+def get_sso_provider_availability(
+    settings: PortalSettings | None = None,
+) -> dict[str, bool]:
+    """Return ``{provider: bool}`` for every entry in ``ALL_SSO_PROVIDERS``,
+    and nothing else.
+
+    This is the exact function a downstream route (e.g. ``GET
+    /api/v1/portal/auth/sso/providers``) should call and serialize verbatim
+    when the SPA needs to know which login buttons to render. It answers
+    only "is this provider enabled *and* does it look minimally configured"
+    -- it never returns an issuer URL, a client id, a corp id, an agent id,
+    or (obviously) any of the three secret fields. A downstream route must
+    not substitute a blanket ``dataclasses.asdict(settings)``/``vars(settings)``
+    dump for this function "for convenience" -- that would serialize
+    ``oidc_client_secret``/``wecom_app_secret``/``feishu_app_secret``
+    directly into an HTTP response, which is precisely the "must not be
+    logged or echoed back by any endpoint" requirement this phase's
+    assignment calls out.
+
+    "Minimally configured" is a presence check only (``bool(value)``), not
+    a validity check (e.g. a malformed issuer URL still counts as
+    "present" here) -- this function's job is to tell the SPA which login
+    buttons make sense to show, not to validate the deployment's SSO
+    configuration; a genuinely broken value still fails later, at the
+    actual authorize/token-exchange step, the same place it would fail
+    without this function existing at all.
+    """
+    settings = settings or get_portal_settings()
+
+    if not settings.sso_enabled:
+        return dict.fromkeys(ALL_SSO_PROVIDERS, False)
+
+    return {
+        SSO_PROVIDER_OIDC: (
+            SSO_PROVIDER_OIDC in settings.sso_enabled_providers
+            and bool(settings.oidc_client_id)
+            and bool(settings.oidc_client_secret)
+            and bool(settings.oidc_issuer or settings.oidc_discovery_url)
+        ),
+        SSO_PROVIDER_WECOM: (
+            SSO_PROVIDER_WECOM in settings.sso_enabled_providers
+            and bool(settings.wecom_corp_id)
+            and bool(settings.wecom_agent_id)
+            and bool(settings.wecom_app_secret)
+        ),
+        SSO_PROVIDER_FEISHU: (
+            SSO_PROVIDER_FEISHU in settings.sso_enabled_providers
+            and bool(settings.feishu_app_id)
+            and bool(settings.feishu_app_secret)
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
