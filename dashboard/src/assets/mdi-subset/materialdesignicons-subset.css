@@ -1,4 +1,4 @@
-/* Auto-generated MDI subset – 292 icons */
+/* Auto-generated MDI subset – 295 icons */
 /* Do not edit manually. Run: pnpm run subset-icons */
 
 @font-face {
@@ -36,8 +36,16 @@
   content: "\F0FFB";
 }
 
+.mdi-account-group::before {
+  content: "\F0849";
+}
+
 .mdi-account-heart::before {
   content: "\F0899";
+}
+
+.mdi-account-multiple-plus::before {
+  content: "\F0010";
 }
 
 .mdi-account-off-outline::before {
@@ -126,6 +134,10 @@
 
 .mdi-backup-restore::before {
   content: "\F006F";
+}
+
+.mdi-book-lock::before {
+  content: "\F079A";
 }
 
 .mdi-book-off-outline::before {

@@ -84,6 +84,30 @@ const sidebarItem: menu[] = [
     to: '/persona'
   },
   {
+    // The end-user Portal's operator surface. These three pages had routes but
+    // no menu entry, so they were reachable only by typing the URL -- see
+    // docs/*/use/portal.md, which tells operators to find them here.
+    title: 'core.navigation.groups.portal',
+    icon: 'mdi-account-group',
+    children: [
+      {
+        title: 'core.navigation.portalUsers',
+        icon: 'mdi-account-multiple-plus',
+        to: '/portal-users'
+      },
+      {
+        title: 'core.navigation.portalKbVisibility',
+        icon: 'mdi-book-lock',
+        to: '/portal-kb-visibility'
+      },
+      {
+        title: 'core.navigation.portalAgentBundles',
+        icon: 'mdi-package-variant-closed',
+        to: '/portal-agent-bundles'
+      }
+    ]
+  },
+  {
     title: 'core.navigation.groups.more',
     icon: 'mdi-dots-horizontal',
     children: [

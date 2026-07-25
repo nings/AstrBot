@@ -32,7 +32,8 @@
   "github": "GitHub",
   "drag": "拖拽",
   "groups": {
-    "more": "更多功能"
+    "more": "更多功能",
+    "portal": "Portal 多用户前端"
   },
   "changelogDialog": {
     "title": "更新日志",
@@ -46,5 +47,8 @@
     "normal": "普通配置",
     "system": "系统配置"
   },
-  "pluginWebui": "插件页面"
+  "pluginWebui": "插件页面",
+  "portalUsers": "Portal 用户管理",
+  "portalKbVisibility": "Portal 知识库可见性",
+  "portalAgentBundles": "Portal Agent Bundle"
 }

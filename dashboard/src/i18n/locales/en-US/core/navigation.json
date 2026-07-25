@@ -32,7 +32,8 @@
   "github": "GitHub",
   "drag": "Drag",
   "groups": {
-    "more": "More Features"
+    "more": "More Features",
+    "portal": "Portal"
   },
   "changelogDialog": {
     "title": "Changelog",
@@ -46,5 +47,8 @@
     "normal": "Normal Config",
     "system": "System Config"
   },
-  "pluginWebui": "Plugin Pages"
+  "pluginWebui": "Plugin Pages",
+  "portalUsers": "Portal Users",
+  "portalKbVisibility": "Portal KB Visibility",
+  "portalAgentBundles": "Portal Agent Bundles"
 }
