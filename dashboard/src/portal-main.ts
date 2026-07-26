@@ -50,9 +50,31 @@ async function bootstrap() {
   app.use(router);
 
   app.use(vuetify);
+  syncThemeWithSystem();
 
   await router.isReady();
   app.mount('#app');
+}
+
+/**
+ * Follow the visitor's OS colour scheme.
+ *
+ * The operator dashboard drives Vuetify's theme from its own customizer store,
+ * which an end user has no access to — so without this the portal rendered its
+ * components' dark styles while Vuetify itself stayed on the light theme,
+ * producing a dark sidebar over a white page. An end-user product has no
+ * business asking for a theme preference it can read from the system.
+ */
+function syncThemeWithSystem(): void {
+  if (typeof window === 'undefined' || !window.matchMedia) return;
+
+  const query = window.matchMedia('(prefers-color-scheme: dark)');
+  const apply = (isDark: boolean) => {
+    vuetify.theme.global.name.value = isDark ? 'PurpleThemeDark' : 'PurpleTheme';
+  };
+
+  apply(query.matches);
+  query.addEventListener('change', (event) => apply(event.matches));
 }
 
 void bootstrap();

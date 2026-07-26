@@ -16,7 +16,10 @@
       </div>
 
       <div v-if="!activeSessionId" class="chat-empty-state">
-        <p>选择左侧的一个会话，或新建一个开始聊天。</p>
+        <div class="welcome-state">
+          <div class="welcome-title">开始一段新对话</div>
+          <div class="welcome-subtitle">从左侧新建对话，或继续之前的一段。</div>
+        </div>
       </div>
 
       <template v-else>
@@ -43,13 +46,24 @@
           {{ resumeNotice }}
         </div>
 
+        <!-- Messages and composer share one flex column so that, while the
+             conversation is empty, the greeting and the composer centre
+             together as a single block instead of the composer docking to the
+             bottom of an empty page -- the operator ChatUI's
+             `.conversation-stack.is-empty` behaviour. -->
+        <div
+          class="conversation-stack"
+          :class="{ 'is-empty': !loadingMessages && !messages.length }"
+        >
         <div ref="messageScrollRef" class="chat-scroll">
           <div v-if="loadingMessages" class="chat-center-state">
             <v-progress-circular indeterminate size="28" width="3" />
           </div>
 
           <div v-else-if="!messages.length" class="chat-center-state">
-            <span>还没有消息，发送第一条试试。</span>
+            <div class="welcome-state">
+              <div class="welcome-title">今天想聊点什么？</div>
+            </div>
           </div>
 
           <div v-else class="chat-messages">
@@ -229,9 +243,11 @@
             ref="composerRef"
             :is-generating="isGenerating"
             :disabled="!activeSessionId"
+            :is-dark="isDark"
             @send="sendMessage"
             @stop="stopGeneration"
           />
+        </div>
         </div>
       </template>
     </div>
@@ -330,7 +346,9 @@ import {
   reactive,
   ref,
   type PropType,
+  watch,
 } from "vue";
+import { useRoute, useRouter } from "vue-router";
 import { MarkdownRender } from "markstream-vue";
 import {
   PORTAL_CHAT_CUSTOM_ID,
@@ -718,6 +736,37 @@ function handleDarkChange(event: MediaQueryListEvent) {
 onMounted(() => {
   darkMediaQuery = window.matchMedia?.("(prefers-color-scheme: dark)") ?? null;
   darkMediaQuery?.addEventListener("change", handleDarkChange);
+});
+
+// `/chat/:sessionId` is a real route, so it has to open that conversation.
+// Without this the id was never read: a shared link, a bookmark, or simply
+// reloading the page mid-conversation all landed on the empty state while the
+// URL still claimed a session.
+const route = useRoute();
+const router = useRouter();
+
+watch(
+  () => route.params.sessionId,
+  (raw) => {
+    const sessionId = Array.isArray(raw) ? raw[0] : raw;
+    if (!sessionId || sessionId === activeSessionId.value) return;
+    void selectSession(sessionId, null);
+  },
+  { immediate: true },
+);
+
+// Keep the URL in step when the user picks a conversation, so the address bar
+// stays shareable and the browser's back button behaves.
+watch(activeSessionId, (sessionId) => {
+  const current = Array.isArray(route.params.sessionId)
+    ? route.params.sessionId[0]
+    : route.params.sessionId;
+  if (sessionId === (current ?? null)) return;
+  void router.replace(
+    sessionId
+      ? { name: "portal-chat-session", params: { sessionId } }
+      : { name: "portal-chat" },
+  );
 });
 
 onBeforeUnmount(() => {
@@ -1284,23 +1333,45 @@ async function regenerateLast() {
 </script>
 
 <style scoped>
+/* The token set below is the operator ChatUI's own (`@/components/chat/Chat.vue`),
+   adopted verbatim so the two surfaces share one design language. The portal
+   previously defined only two of these, which is why it read as a plainer,
+   unrelated app: without the sidebar/page/active-session tokens every surface
+   fell back to flat Vuetify defaults. */
 .portal-chat-shell {
-  --chat-border: rgba(var(--v-border-color), 0.16);
+  --chat-sidebar-bg: rgb(var(--v-theme-surface));
+  --chat-session-active-bg: #efefef;
+  --chat-page-bg: #fdfcfc;
+  --chat-border: #f2f2f2;
   --chat-muted: rgba(var(--v-theme-on-surface), 0.62);
+  --chat-section-label: rgba(var(--v-theme-on-surface), 0.48);
+  --chat-content-width: 76%;
+  --chat-content-max-width: 760px;
   display: flex;
-  height: 100%;
+  /* Not `height: 100%`: nothing between this and `<body>` declares a height,
+     so a percentage collapses the shell to its content and leaves the sidebar
+     and page background ending mid-screen. `dvh` also keeps the composer above
+     a mobile browser's collapsing toolbar. */
+  height: 100vh;
+  height: 100dvh;
   min-height: 0;
   color: rgb(var(--v-theme-on-surface));
-  background: rgb(var(--v-theme-background));
+  background: var(--chat-page-bg);
 }
 
 .portal-chat-shell.is-dark {
+  --chat-sidebar-bg: #2d2d2d;
+  --chat-session-active-bg: rgba(255, 255, 255, 0.08);
+  --chat-page-bg: rgb(var(--v-theme-background));
   --chat-border: rgba(255, 255, 255, 0.1);
+  --chat-section-label: rgba(255, 255, 255, 0.5);
 }
 
 .session-rail {
   width: 260px;
   flex: 0 0 260px;
+  min-height: 0;
+  background: var(--chat-sidebar-bg);
   border-right: 1px solid var(--chat-border);
 }
 
@@ -1310,6 +1381,7 @@ async function regenerateLast() {
   flex-direction: column;
   min-width: 0;
   min-height: 0;
+  background: var(--chat-page-bg);
 }
 
 .banner {
@@ -1347,6 +1419,31 @@ async function regenerateLast() {
   justify-content: center;
   color: var(--chat-muted);
   font-size: 14px;
+}
+
+/* The greeting treatment from the operator ChatUI's `.welcome-state`
+   (`@/components/chat/Chat.vue`): Outfit at 28px/800 over a muted subtitle,
+   centred in the conversation area. `Outfit` and `Noto Sans` are already
+   loaded by `portal.html`, so no new font request is introduced. */
+.welcome-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+.welcome-title {
+  font-family: "Outfit", "Noto Sans", sans-serif;
+  font-size: 28px;
+  font-weight: 800;
+  color: rgb(var(--v-theme-on-surface));
+}
+
+.welcome-subtitle {
+  margin-top: 8px;
+  color: var(--chat-muted);
+  font-size: 16px;
 }
 
 .chat-header {
@@ -1545,10 +1642,46 @@ async function regenerateLast() {
   font-weight: 600;
 }
 
+.conversation-stack {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+.conversation-stack.is-empty {
+  justify-content: center;
+  gap: 28px;
+}
+
+.conversation-stack.is-empty .chat-scroll {
+  flex: none;
+  min-height: auto;
+  overflow: visible;
+  padding: 0;
+}
+
 .chat-composer {
   flex-shrink: 0;
   padding: 14px 20px 18px;
   border-top: 1px solid var(--chat-border);
+}
+
+/* No divider above a composer that is floating mid-page with the greeting --
+   the rule only reads as a separator when there is a conversation above it. */
+.conversation-stack.is-empty .chat-composer {
+  border-top: 0;
+  padding-top: 0;
+}
+
+/* Messages and composer share the reading column the operator ChatUI uses, so
+   text does not run the full width of a large display. */
+.chat-messages,
+.chat-composer > * {
+  width: var(--chat-content-width);
+  max-width: var(--chat-content-max-width);
+  margin-inline: auto;
 }
 
 @media (max-width: 760px) {

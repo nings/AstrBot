@@ -1,15 +1,32 @@
 <template>
   <div class="portal-session-list">
-    <div class="session-list-header">
-      <span class="session-list-title">会话</span>
-      <v-btn
-        icon="mdi-plus"
-        size="small"
-        variant="tonal"
-        color="primary"
-        :loading="creating"
-        @click="createSession"
+    <!-- Brand row, then the primary action, then the list -- the operator
+         ChatUI's sidebar order. `ChatUILogo` is the shared mark and is not on
+         the portal's forbidden-import list. -->
+    <div class="rail-brand">
+      <ChatUILogo class="rail-logo" />
+      <span class="rail-brand-name">AstrBot</span>
+    </div>
+
+    <button
+      type="button"
+      class="rail-action"
+      :disabled="creating"
+      @click="createSession"
+    >
+      <v-icon icon="mdi-square-edit-outline" size="18" />
+      <span>创建对话</span>
+      <v-progress-circular
+        v-if="creating"
+        class="rail-action-spinner"
+        indeterminate
+        size="14"
+        width="2"
       />
+    </button>
+
+    <div class="session-list-header">
+      <span class="session-list-title">对话</span>
     </div>
 
     <div v-if="loadError" class="session-list-error">
@@ -106,6 +123,11 @@
 // exists in this phase's file ownership, so the same small helper is
 // duplicated here and in `PortalChatShell.vue`.
 import { computed, nextTick, onMounted, reactive, ref } from "vue";
+// The shared AstrBot mark. Importable here: the portal's ESLint boundary
+// forbids the operator *chat surface* components (Chat.vue, ChatMessageList,
+// ConfigSelector, ProviderModelMenu, CommandSuggestion, useSessions), none of
+// which this is -- it is a standalone inline SVG with no operator assumptions.
+import ChatUILogo from "@/components/chat/ChatUILogo.vue";
 
 interface PortalSession {
   session_id: string;
@@ -381,20 +403,75 @@ defineExpose({ refresh });
   color: rgb(var(--v-theme-on-surface));
 }
 
+.rail-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  padding: 14px 14px 10px;
+}
+
+.rail-logo {
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+}
+
+.rail-brand-name {
+  font-family: "Outfit", "Noto Sans", sans-serif;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+/* A quiet full-width row rather than a filled button: the primary action in
+   the operator sidebar reads as navigation, not as a call to action. */
+.rail-action {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+  width: calc(100% - 12px);
+  margin: 0 6px 10px;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: rgb(var(--v-theme-on-surface));
+  font: inherit;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.rail-action:hover:not(:disabled) {
+  background: rgba(var(--v-theme-on-surface), 0.06);
+}
+
+.rail-action:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.rail-action-spinner {
+  margin-left: auto;
+}
+
 .session-list-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 12px;
+  padding: 6px 16px 4px;
   flex-shrink: 0;
 }
 
+/* Sentence case at label scale, using the shared section-label token -- the
+   uppercase/letterspaced treatment this replaced belonged to a different
+   design language than the rest of the product. */
 .session-list-title {
-  font-size: 13px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
-  color: rgba(var(--v-theme-on-surface), 0.6);
-  text-transform: uppercase;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--chat-section-label, rgba(var(--v-theme-on-surface), 0.48));
 }
 
 .session-list-error {
@@ -444,9 +521,13 @@ defineExpose({ refresh });
   background: rgba(var(--v-theme-on-surface), 0.06);
 }
 
+/* Neutral selection, matching the operator sidebar. A primary-tinted, primary-
+   coloured row competes with the conversation for attention; which item is
+   selected is positional information, not an accent. */
 .session-item.active {
-  background: rgba(var(--v-theme-primary), 0.12);
-  color: rgb(var(--v-theme-primary));
+  background: var(--chat-session-active-bg, rgba(var(--v-theme-on-surface), 0.08));
+  color: rgb(var(--v-theme-on-surface));
+  font-weight: 500;
 }
 
 .session-title {
