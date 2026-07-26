@@ -1,5 +1,13 @@
 # AstrBot 多用户 C 端聊天前端 —— 最终架构决策与实施路线图
 
+> [!NOTE]
+> **历史文档。** 本文记录的是 Portal 最初的架构决策，其中「终端用户 SPA 作为
+> `dashboard/` 的第二个 Vite 入口、由 `astrbot/portal/api/static_router.py` 在
+> `/portal` 托管」这一部分**已经不再成立**：前端已拆分为独立项目
+> [AstrBotDevs/astrbot-portal](https://github.com/AstrBotDevs/astrbot-portal)，
+> AstrBot 只提供 API。后端的能力墙、umo 隔离、安全清单等决策仍然有效。
+> 当前部署方式见 [`docs/zh/use/portal.md`](../docs/zh/use/portal.md)。
+
 版本：v1.1 作者：首席架构师（综合 P1/P2/P3 三方案 + 三评审视角）
 状态：**Phase 1-5 已全部实现**。上文第 1-8 节保留为定案时的原始设计基线；实现过程中的偏差、以及尚未达成的项，一律记录在**第 9 节**，不回改上文。
 

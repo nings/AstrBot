@@ -8,10 +8,10 @@ public at ``/api/v1/portal/*`` -- e.g. ``/portal/auth/login`` (declared in
 ``auth_routes.py`` under its own ``/portal/auth`` sub-prefix) becomes
 ``/api/v1/portal/auth/login``.
 
-This is the *API* router only. The end-user SPA's static asset serving
-(``/portal`` and ``/portal/assets/...``, no ``/api/v1`` prefix at all) is a
-separate router -- ``static_router.py`` -- mounted directly onto the
-FastAPI app, not through this aggregate.
+This is the *API* router, and it is all AstrBot serves for the portal. The
+end-user SPA is a separate project with its own deployment
+(https://github.com/AstrBotDevs/astrbot-portal); nothing here serves static
+assets. See ``PortalSettings.cors_allowed_origins`` for the cross-origin case.
 
 ``chat_routes.py`` and ``file_routes.py`` are each owned by a different,
 concurrently-developed assignment in this same phase; they are imported

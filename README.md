@@ -53,7 +53,7 @@ AstrBot is an open-source all-in-one Agent chatbot platform that integrates with
 7. 💻 WebUI Support.
 8. 🌈 Web ChatUI Support with built-in agent sandbox and web search.
 9. 🌐 Internationalization (i18n) Support.
-10. 👥 **Portal** — a multi-user chat frontend for your own end users, with per-user accounts and isolated history, operator-curated knowledge bases and agent presets, upload quotas, and invite-based provisioning. See [docs/en/use/portal.md](docs/en/use/portal.md). *Added on this branch; read the deployment prerequisites before exposing it publicly.*
+10. 👥 **Portal** — a multi-user chat frontend for your own end users, with per-user accounts and isolated history, operator-curated knowledge bases and agent presets, upload quotas, and invite-based provisioning. AstrBot serves the API; the chat frontend is a separate project, [AstrBotDevs/astrbot-portal](https://github.com/AstrBotDevs/astrbot-portal). See [docs/en/use/portal.md](docs/en/use/portal.md). *Added on this branch; read the deployment prerequisites before exposing it publicly.*
 
 <br>
 

@@ -52,7 +52,7 @@ AstrBot 是一个开源的一站式 Agentic 个人和群聊助手，可在 QQ、
 7. 💻 WebUI 支持。
 8. 🌈 Web ChatUI 支持，ChatUI 内置代理沙盒、网页搜索等。
 9. 🌐 国际化（i18n）支持。
-10. 👥 **Portal 多用户前端** —— 面向你自己的终端用户：各自注册登录、历史互相隔离，知识库与 Agent 套餐由运维方策展，带上传配额与邀请开户。见 [docs/zh/use/portal.md](docs/zh/use/portal.md)。*本分支新增；对外开放前请先读其中的部署前提。*
+10. 👥 **Portal 多用户前端** —— 面向你自己的终端用户：各自注册登录、历史互相隔离，知识库与 Agent 套餐由运维方策展，带上传配额与邀请开户。AstrBot 提供 API，聊天前端是独立项目 [AstrBotDevs/astrbot-portal](https://github.com/AstrBotDevs/astrbot-portal)。见 [docs/zh/use/portal.md](docs/zh/use/portal.md)。*本分支新增；对外开放前请先读其中的部署前提。*
 
 <br>
 

@@ -5,18 +5,15 @@
   "author": "CodedThemes",
   "scripts": {
     "dev": "node scripts/subset-mdi-font.mjs && vite --host",
-    "dev:portal": "node scripts/subset-mdi-font.mjs && vite --config vite.portal.config.ts --host",
     "build:t2i-shiki-runtime": "node scripts/build-t2i-shiki-runtime.mjs",
     "build": "node scripts/subset-mdi-font.mjs && vue-tsc --noEmit && vite build",
-    "build:portal": "node scripts/subset-mdi-font.mjs && vue-tsc --noEmit && vite build --config vite.portal.config.ts",
     "build-stage": "node scripts/subset-mdi-font.mjs && vue-tsc --noEmit && vite build --base=/vue/free/stage/",
     "build-prod": "node scripts/subset-mdi-font.mjs && vue-tsc --noEmit && vite build --base=/vue/free/",
     "preview": "vite preview --port 5050",
     "generate:api": "rm -rf src/api/generated/openapi-v1 src/api/generated/openapi-v1.ts && openapi-ts -i ../openspec/openapi-v1.yaml -o src/api/generated/openapi-v1 -c @hey-api/client-axios",
     "generate:docs:openapi": "uv run python ../docs/scripts/update_openapi_json.py",
     "typecheck": "vue-tsc --noEmit",
-    "lint": "eslint . --ext .vue,.js,.jsx,.cjs,.mjs,.ts,.tsx,.cts,.mts --fix --ignore-path .gitignore",
-    "lint:portal": "eslint src/components/portal src/portal-main.ts src/api/portal.ts src/stores/portalAuth.ts src/router/EndUserRoutes.ts src/composables/usePortalMediaHandling.ts --ext .vue,.ts --max-warnings 0"
+    "lint": "eslint . --ext .vue,.js,.jsx,.cjs,.mjs,.ts,.tsx,.cts,.mts --fix --ignore-path .gitignore"
   },
   "dependencies": {
     "@guolao/vue-monaco-editor": "^1.5.4",

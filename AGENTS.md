@@ -21,21 +21,19 @@ Runs on `http://localhost:3000` by default.
 
 ### Portal (end-user chat frontend)
 
-`dashboard/` builds **two** bundles from one source tree. The WebUI above is the
-operator console; Portal is the multi-user frontend for end users, served at
-`/portal`.
+`astrbot/portal/**` is the multi-user API for end users. **Its frontend is not
+in this repository** — it lives in
+[AstrBotDevs/astrbot-portal](https://github.com/AstrBotDevs/astrbot-portal) and
+is deployed separately, so `dashboard/` builds only the operator WebUI. The
+three `Portal*AdminPage.vue` files under `dashboard/src/components/admin/` are
+the operator side of Portal and do stay here.
 
-```
-cd dashboard
-npm run dev:portal      # hot reload
-npm run build:portal    # -> dashboard/dist-portal/
-npm run lint:portal     # enforced import boundary, --max-warnings 0
-```
+If you change a route, a response shape, or a cookie/CSRF name under
+`astrbot/portal/api/**`, that is a cross-repository contract change: the SPA
+consumes it directly. Cookie and header names are additionally protected from
+config overrides for the same reason (see `NON_OVERRIDABLE_FIELDS`).
 
-Both bundles must build before a release; the packaging in
-`scripts/hatch_build.py` and the release/docker workflows handle each separately.
-
-Working on `astrbot/portal/**` has three rules that CI enforces:
+Working on `astrbot/portal/**` has two rules that CI enforces:
 
 1. **Capability wall.** Only `services/core_facade.py` may import
    `chat_service` / `conversation_mgr` / `shared_preferences` / `persona_mgr`;
@@ -47,9 +45,6 @@ Working on `astrbot/portal/**` has three rules that CI enforces:
    mount). Anything else is a regression — extend the
    `SessionRuleGuard` registration hook in
    `dashboard/services/session_management_service.py` instead.
-3. **Frontend import boundary.** `dashboard/src/components/portal/**` may not
-   reach operator-only components (`ProviderModelMenu.vue`, `ConfigSelector.vue`,
-   `Chat.vue`, …); ESLint blocks it.
 
 Design rationale, the security checklist, and the record of what diverged during
 implementation live in [`design/portal-multiuser-plan.md`](design/portal-multiuser-plan.md).

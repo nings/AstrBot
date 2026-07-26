@@ -9,7 +9,7 @@ Portal 是一个面向**终端用户**的聊天界面：用户各自注册/登�
 | 面向谁 | **你**（运维方） | **你的用户** |
 | 身份模型 | 单一管理员账号 | 多用户，各自独立账号 |
 | 能做什么 | 配置模型、装插件、看日志、改配置 | 只能聊天 |
-| 访问路径 | `/` | `/portal` |
+| 部署位置 | 由 AstrBot 在 `/` 提供 | 独立项目，由你自己部署 |
 | Cookie | `astrbot_dashboard_jwt` | `astrbot_portal_jwt` |
 
 两套认证体系的签名密钥、Cookie 名、claim 形状完全独立，互不识别：Portal 的 token 打到 WebUI 的接口是 401，反之亦然。
@@ -19,26 +19,67 @@ Portal 是一个面向**终端用户**的聊天界面：用户各自注册/登�
 
 ## 快速开始
 
-Portal 是与 WebUI 并列的第二个前端构建产物。
+**AstrBot 只提供 Portal 的 API，不提供 Portal 前端。** 聊天界面是一个独立项目——[AstrBotDevs/astrbot-portal](https://github.com/AstrBotDevs/astrbot-portal)——这样两者可以各自独立更新。AstrBot 的 Docker 镜像与 release 压缩包里只有 WebUI。
+
+从那个仓库部署前端：
 
 ```bash
-cd dashboard
-npm run build:portal      # 产物在 dashboard/dist-portal/
+git clone https://github.com/AstrBotDevs/astrbot-portal
+cd astrbot-portal
+npm install
+npm run build      # 产物在 dist/
 ```
 
-启动 AstrBot 后访问 `http://localhost:6185/portal`。首次访问会看到登录页，可以直接注册（默认开放自助注册）。
+然后用任意 web server 托管 `dist/`。接到 AstrBot 上有两种方式，**强烈建议用第一种**。
 
-开发时热重载：
+### 方式一：反代到同一个域名（推荐）
+
+前端和 `/api/` 反代挂在同一个域名下。浏览器看到的是单一 origin，会话 cookie 保持第一方，完全不涉及 CORS。AstrBot 侧无需任何配置。
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name chat.example.com;
+
+    root /srv/astrbot-portal/dist;
+    location / { try_files $uri $uri/ /index.html; }
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:6185;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;   # AstrBot 靠它决定 cookie 的 Secure 标志
+        proxy_buffering off;                          # 回复是 SSE 流式
+        proxy_read_timeout 3600s;
+    }
+}
+```
+
+### 方式二：独立域名 + CORS
+
+> [!WARNING]
+> 这会让 Portal 的会话 cookie 变成**第三方 cookie**。Safari 默认拦截、Chrome 正在逐步淘汰，因此会有一部分用户悄无声息地无法保持登录状态。AstrBot 和前端都绕不过这一点。除非确实做不到单一 origin，否则请用方式一。
+
+构建时把 API 的 origin 编进去，然后在 `cmd_config.json` 里把前端 origin 加入白名单：
 
 ```bash
-npm run dev:portal
+VITE_API_BASE_URL=https://bot.example.com npm run build
 ```
 
-Docker 镜像与 release 压缩包已包含这个产物，无需额外操作。若你自己打 wheel，需要 `ASTRBOT_BUILD_DASHBOARD=1 uv build`。
+```jsonc
+{
+  "portal": {
+    "cors_allowed_origins": ["https://chat.example.com"],
+    "cross_origin_cookies": true
+  }
+}
+```
+
+两侧都必须是 HTTPS——`SameSite=None` 只有配合 `Secure` 才会被浏览器接受。如果开了 `cross_origin_cookies` 而白名单里存在 `http://` 的 origin，AstrBot 会直接拒绝启动（localhost 例外，方便本地开发）。CORS 的作用范围仅限终端用户 API，刻意排除了 `/api/v1/portal/admin/*`。
 
 ## 用户从哪来
 
-Portal 支持三种身份方式，但**当前只有第一种真正可用**：
+Portal 支持三种身份方式：
 
 ### 1. 自助注册（可用）
 
@@ -53,9 +94,27 @@ Portal 支持三种身份方式，但**当前只有第一种真正可用**：
 
 邀请为一次性使用，默认 7 天过期。已使用的链接被再次打开返回 410。
 
-### 3. SSO（已实现，但当前无法启用）
+### 3. SSO（可用）
 
-通用 OIDC、企业微信、飞书三种 SSO 都已完整实现并有测试覆盖，但**目前没有配置入口**——见下方「配置」一节。在补上配置机制之前，登录页不会出现任何 SSO 按钮。
+通用 OIDC、企业微信、飞书。在 `cmd_config.json` 的 `portal` 段下配置：
+
+```jsonc
+{
+  "portal": {
+    "sso_enabled": true,
+    "sso_enabled_providers": ["oidc"],
+    // 前端自己的公开地址。各 provider 的 redirect_uri 由
+    // {base}/oauth/callback/{provider} 推导，必须与 IdP 应用注册里
+    // 登记的回调地址完全一致。
+    "sso_redirect_base_url": "https://chat.example.com",
+    "oidc_issuer": "https://accounts.example.com",
+    "oidc_client_id": "…",
+    "oidc_client_secret": "…"
+  }
+}
+```
+
+只有同时「已启用」且「凭证填齐」的 provider 才会渲染登录按钮——配置了一半的 provider 不会露出按钮，而不是点了才报错。`sso_redirect_base_url` 是必填项：没有它，无论其他项怎么配 SSO 都拒绝启动；AstrBot 登录后的跳转白名单也是从它推导出来的。
 
 另外请注意一个产品行为：**SSO 只是已有账号的登录方式，不是注册通道。** 未绑定的身份直接被拒绝，用户必须先由你开户或邀请，然后在已登录状态下绑定 SSO 身份（需二次确认）。这样设计是为了从结构上消灭"让身份提供方声称某个邮箱以取得该账号"这类接管攻击。如果你的预期是"扫码即用、无需预先开户"，这是需要改的产品决策。
 
@@ -149,10 +208,14 @@ WebUI → **Portal Agent Bundle**。一个 Bundle 是你组合好的 **persona +
 
 ## 配置
 
-> [!WARNING]
-> **当前 Portal 没有配置入口。** `get_portal_settings()` 返回代码里的硬编码默认值，不读环境变量、不读 `cmd_config.json`、也没有管理界面。要改任何一项，目前唯一的办法是编辑 `astrbot/portal/config.py` 中的 `PortalSettings` 默认值并重启。
->
-> 这直接的后果是 **SSO 无法启用**（`sso_enabled = False`、`sso_enabled_providers` 为空、三组凭证均为 `None`），配额与上限也全部锁死在下表数值。补上配置机制是这个模块最优先的待办项。
+配置项写在 `data/cmd_config.json` 的 `portal` 段下，启动时生效。键名与 `astrbot/portal/config.py` 中 `PortalSettings` 的字段一一对应，因此那里有的字段都可以配，哪怕没出现在默认模板里。
+
+两个刻意为之的行为：
+
+- **未知的键会让启动直接失败**，而不是被静默忽略——这样配置项名字写错了不会悄悄退回默认值。
+- **Cookie 名和 CSRF 头名不允许覆盖。** 它们是与前端共享的通信协议，不是偏好设置；改名会在「看起来像个正常配置项」的同时让所有客户端失效。
+
+目前还没有对应的管理界面，改完需要重启。
 
 主要默认值（`astrbot/portal/config.py`）：
 
@@ -172,19 +235,23 @@ WebUI → **Portal Agent Bundle**。一个 Bundle 是你组合好的 **persona +
 | `agent_bundle_selection_enabled` | `True` | 是否允许用户选 Agent Bundle |
 | `invite_token_ttl_seconds` | `604800` | 邀请链接 7 天有效 |
 | `sso_enabled` | `False` | SSO 总开关 |
+| `cors_allowed_origins` | `[]` | 允许跨域调用 API 的 origin。留空表示完全不安装 CORS 中间件。不接受 `"*"` |
+| `cross_origin_cookies` | `False` | 把 cookie 改为 `SameSite=None; Secure`。依赖上一项，且要求 HTTPS |
 
 允许上传的 MIME 类型是**白名单**（AstrBot 核心本身对上传既无大小限制也无类型限制，所有边界都来自这里）：图片 png/jpeg/gif/webp、音频 wav/mpeg/aac/ogg/webm/mp4、视频 mp4/webm/quicktime、文档 pdf/plain/csv/json。
 
 ## 已知限制
 
-除上面已说明的「无配置入口」与「单进程」之外：
+除上面已说明的「单进程」之外：
 
-1. **没有密码重置流程。** 它依赖发邮件，而 AstrBot 没有邮件能力。用户忘记密码只能由你重新签发邀请。
-2. **AGPL §13 源码端点未实现。** AstrBot 以 AGPL-3.0 授权，对外提供网络服务时需要向使用者提供**实际运行的那份**源码。登录页目前的源码链接指向上游仓库，而不是你实际运行的 commit。**如果你把 Portal 开放给外部用户，这是必须先补的合规前置。**
-3. **非图片类型的 MIME 只做声明级校验。** 核心只嗅探图片真实类型；Portal 额外为 PDF（magic bytes）和 JSON（可解析性）做了内容校验，音视频与文本仍只信客户端声明的 Content-Type。
-4. **配额是每用户维度，没有全局磁盘水位保护。** 所有用户合起来仍可能填满磁盘。
-5. **无自助 SSO 绑定入口。** 后端的绑定/解绑接口已就绪，但终端用户界面里还没有账号设置页去发起它。
-6. **未做子代理级选择。** 用户只能选 Bundle（persona+模型+知识库套餐），不能直接选子代理——真正的子代理隔离需要改动 AstrBot 核心。
+1. **跨域部署依赖第三方 cookie。** 见「快速开始」的方式二。如果这是你唯一可行的拓扑，请预期 Safari 用户无法保持登录；根治办法是改用基于 token 的鉴权模式，目前还没有。
+
+2. **没有密码重置流程。** 它依赖发邮件，而 AstrBot 没有邮件能力。用户忘记密码只能由你重新签发邀请。
+3. **AGPL §13 源码端点未实现。** AstrBot 以 AGPL-3.0 授权，对外提供网络服务时需要向使用者提供**实际运行的那份**源码。登录页目前的源码链接指向上游仓库，而不是你实际运行的 commit。**如果你把 Portal 开放给外部用户，这是必须先补的合规前置。**
+4. **非图片类型的 MIME 只做声明级校验。** 核心只嗅探图片真实类型；Portal 额外为 PDF（magic bytes）和 JSON（可解析性）做了内容校验，音视频与文本仍只信客户端声明的 Content-Type。
+5. **配额是每用户维度，没有全局磁盘水位保护。** 所有用户合起来仍可能填满磁盘。
+6. **无自助 SSO 绑定入口。** 后端的绑定/解绑接口已就绪，但终端用户界面里还没有账号设置页去发起它。
+7. **未做子代理级选择。** 用户只能选 Bundle（persona+模型+知识库套餐），不能直接选子代理——真正的子代理隔离需要改动 AstrBot 核心。
 
 ## 相关文档
 

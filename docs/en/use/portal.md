@@ -9,7 +9,7 @@ It is not the same thing as the [WebUI](./webui.md), and confusing the two is da
 | Who it is for | **you** (the operator) | **your users** |
 | Identity model | one admin account | many users, separate accounts |
 | What it can do | configure models, install plugins, read logs, change config | chat, and nothing else |
-| Path | `/` | `/portal` |
+| Where it lives | served by AstrBot at `/` | a separate project you deploy yourself |
 | Cookie | `astrbot_dashboard_jwt` | `astrbot_portal_jwt` |
 
 The two auth systems use independent signing keys, cookie names and claim shapes, and do not recognise each other: a Portal token presented to a WebUI endpoint gets a 401, and vice versa.
@@ -19,30 +19,71 @@ The two auth systems use independent signing keys, cookie names and claim shapes
 
 ## Getting started
 
-Portal is a second frontend bundle alongside the WebUI.
+**AstrBot ships the Portal API, not the Portal frontend.** The chat interface is a separate project — [AstrBotDevs/astrbot-portal](https://github.com/AstrBotDevs/astrbot-portal) — so the two can be updated independently. AstrBot's Docker images and release archives contain the WebUI only.
+
+Deploy the frontend from that repository:
 
 ```bash
-cd dashboard
-npm run build:portal      # output in dashboard/dist-portal/
+git clone https://github.com/AstrBotDevs/astrbot-portal
+cd astrbot-portal
+npm install
+npm run build      # output in dist/
 ```
 
-Start AstrBot and open `http://localhost:6185/portal`. You will land on a login page, and can register directly (self-registration is open by default).
+Then serve `dist/` with any web server. There are two ways to wire it to AstrBot, and **the first is strongly preferred**.
 
-For development with hot reload:
+### Option 1: one origin, via a reverse proxy (recommended)
+
+Serve the SPA and proxy `/api/` to AstrBot from the same hostname. The browser sees a single origin, so session cookies stay first-party and no CORS is involved. Nothing needs configuring on the AstrBot side.
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name chat.example.com;
+
+    root /srv/astrbot-portal/dist;
+    location / { try_files $uri $uri/ /index.html; }
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:6185;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;   # AstrBot reads this for the cookie Secure flag
+        proxy_buffering off;                          # replies are SSE
+        proxy_read_timeout 3600s;
+    }
+}
+```
+
+### Option 2: separate origins, via CORS
+
+> [!WARNING]
+> This makes Portal's session cookies **third-party cookies**. Safari blocks those by default and Chrome has been phasing them out, so a share of your users will silently fail to stay signed in. Nothing in AstrBot or the frontend can work around it. Use option 1 unless a single origin is genuinely impossible.
+
+Build with the API origin compiled in, then allowlist the SPA's origin in `cmd_config.json`:
 
 ```bash
-npm run dev:portal
+VITE_API_BASE_URL=https://bot.example.com npm run build
 ```
 
-Docker images and release archives already include this bundle. If you build a wheel yourself, use `ASTRBOT_BUILD_DASHBOARD=1 uv build`.
+```jsonc
+{
+  "portal": {
+    "cors_allowed_origins": ["https://chat.example.com"],
+    "cross_origin_cookies": true
+  }
+}
+```
+
+Both sides must be HTTPS — `SameSite=None` is only honoured together with `Secure`. AstrBot refuses to start if `cross_origin_cookies` is on while any allowed origin is plain `http://` (localhost is exempt for local development). CORS is scoped to the end-user API and deliberately excludes `/api/v1/portal/admin/*`.
 
 ## Where users come from
 
-Portal supports three identity methods, but **only the first two work today**:
+Portal supports three identity methods:
 
 ### 1. Self-registration (works)
 
-Open by default. Users register an email and password at `/portal`. The password policy is AstrBot's existing one (at least 8 characters, mixed case and a digit), hashed with PBKDF2-SHA256.
+Open by default. Users register an email and password on the Portal sign-in page. The password policy is AstrBot's existing one (at least 8 characters, mixed case and a digit), hashed with PBKDF2-SHA256.
 
 ### 2. Operator-provisioned invites (works)
 
@@ -53,9 +94,27 @@ In the WebUI sidebar, open **Portal User Management** and issue an invite for an
 
 Invites are single-use and expire after 7 days by default. Reopening a consumed link returns 410.
 
-### 3. SSO (implemented, but cannot be enabled yet)
+### 3. SSO (works)
 
-Generic OIDC, WeCom (企业微信) and Feishu (飞书) are all fully implemented and covered by tests, but **there is currently no way to configure them** — see [Configuration](#configuration) below. Until a configuration mechanism exists, no SSO buttons appear on the login page.
+Generic OIDC, WeCom (企业微信) and Feishu (飞书). Configure under `portal` in `cmd_config.json`:
+
+```jsonc
+{
+  "portal": {
+    "sso_enabled": true,
+    "sso_enabled_providers": ["oidc"],
+    // The frontend's own public URL. Each provider's redirect URI is derived
+    // as {base}/oauth/callback/{provider} and must match the IdP app
+    // registration byte-for-byte.
+    "sso_redirect_base_url": "https://chat.example.com",
+    "oidc_issuer": "https://accounts.example.com",
+    "oidc_client_id": "…",
+    "oidc_client_secret": "…"
+  }
+}
+```
+
+A provider only renders a button once it is both enabled *and* fully credentialed — half-configured providers stay invisible rather than failing on click. `sso_redirect_base_url` is required: without it SSO refuses to start regardless of the other settings, and it is also what AstrBot derives its post-login redirect allowlist from.
 
 Note one deliberate product behaviour: **SSO is a sign-in method for accounts that already exist, not a signup path.** An unrecognised identity is rejected; a user must first be provisioned or invited by you, then link their SSO identity while signed in (with an explicit second confirmation). This closes the whole class of "make an identity provider assert a victim's email address to obtain their account" attacks by construction. If you expected "scan a QR code and you're in, no provisioning needed", that is a product decision to change.
 
@@ -67,10 +126,7 @@ All three of these are required.
 
 Portal's end-user API lives under `/api/v1/portal/*` and **must** be publicly reachable. But the same prefix also contains `/api/v1/portal/admin/*`, which carries user provisioning, invite issuance, knowledge-base authorisation and Agent Bundle management. It differs from the end-user paths by one path segment, which makes it the easiest rule to get wrong.
 
-The public internet should reach **only**:
-
-- `/portal/*` (SPA assets)
-- `/api/v1/portal/*` **minus** `/api/v1/portal/admin/*`
+The public internet should reach **only** `/api/v1/portal/*` **minus** `/api/v1/portal/admin/*` (plus, if you are reverse-proxying option 1 above, the SPA's own static files).
 
 These must be restricted to your internal network or VPN:
 
@@ -148,10 +204,14 @@ Users are fully isolated from each other: conversations, messages, attachments a
 
 ## Configuration
 
-> [!WARNING]
-> **Portal currently has no configuration mechanism.** `get_portal_settings()` returns hardcoded defaults from the source: it reads no environment variables, no `cmd_config.json`, and there is no admin UI. Changing any setting today means editing the `PortalSettings` defaults in `astrbot/portal/config.py` and restarting.
->
-> The direct consequence is that **SSO cannot be enabled** (`sso_enabled = False`, `sso_enabled_providers` is empty, and all three credential sets are `None`), and every quota and limit is fixed at the values below. Adding a configuration mechanism is this module's highest-priority outstanding work.
+Settings live under `portal` in `data/cmd_config.json` and are applied at startup. Keys map one-to-one onto the fields of `PortalSettings` in `astrbot/portal/config.py`, so anything documented there can be set even if it is not in the shipped template.
+
+Two deliberate behaviours:
+
+- **An unknown key aborts startup** rather than being ignored, so a typo'd setting name cannot silently leave the value at its default.
+- **The cookie and CSRF header names cannot be overridden.** They are a wire protocol shared with the frontend, not a preference; renaming one would break every client while looking like a valid setting.
+
+There is no admin UI for these yet — edit the file and restart.
 
 Key defaults (`astrbot/portal/config.py`):
 
@@ -171,19 +231,22 @@ Key defaults (`astrbot/portal/config.py`):
 | `agent_bundle_selection_enabled` | `True` | Whether users may select Agent Bundles |
 | `invite_token_ttl_seconds` | `604800` | Invite validity, 7 days |
 | `sso_enabled` | `False` | SSO master switch |
+| `cors_allowed_origins` | `[]` | Origins allowed to call the API cross-origin. Empty means no CORS layer is installed at all. `"*"` is rejected. |
+| `cross_origin_cookies` | `False` | Issue cookies as `SameSite=None; Secure`. Requires the above, and HTTPS. |
 
 Uploads are restricted by an **allowlist** of MIME types — AstrBot's core imposes no size limit and no type restriction at all, so every bound comes from here: images png/jpeg/gif/webp, audio wav/mpeg/aac/ogg/webm/mp4, video mp4/webm/quicktime, documents pdf/plain/csv/json.
 
 ## Known limitations
 
-Besides the missing configuration mechanism and the single-process constraint above:
+Besides the single-process constraint above:
 
-1. **There is no password reset flow.** It depends on sending email, which AstrBot cannot do. A user who forgets their password must be re-invited by you.
-2. **The AGPL §13 source endpoint is not implemented.** AstrBot is licensed AGPL-3.0, which requires offering users of a network service the source of **the version actually running**. The login page's source link currently points at the upstream repository, not at your running commit. **If you open Portal to external users, closing this is a compliance prerequisite.**
-3. **Non-image MIME types are only validated as declared.** The core sniffs real types for images only; Portal additionally verifies PDF (magic bytes) and JSON (parseability), but audio, video and text still rest on the client's declared Content-Type.
-4. **Quotas are per user, with no global disk watermark.** All users together can still fill the disk.
-5. **No self-service SSO linking UI.** The link and unlink endpoints exist, but the end-user interface has no account-settings page to start the flow.
-6. **No subagent-level selection.** Users pick a bundle (persona + model + knowledge bases), not individual subagents; real subagent isolation would require changing AstrBot's core.
+1. **Cross-origin deployments depend on third-party cookies.** See option 2 in [Getting started](#getting-started). If that is your only viable topology, expect Safari users to be unable to stay signed in; the durable fix is a token-based auth mode, which does not exist yet.
+2. **There is no password reset flow.** It depends on sending email, which AstrBot cannot do. A user who forgets their password must be re-invited by you.
+3. **The AGPL §13 source endpoint is not implemented.** AstrBot is licensed AGPL-3.0, which requires offering users of a network service the source of **the version actually running**. The login page's source link currently points at the upstream repository, not at your running commit. **If you open Portal to external users, closing this is a compliance prerequisite.**
+4. **Non-image MIME types are only validated as declared.** The core sniffs real types for images only; Portal additionally verifies PDF (magic bytes) and JSON (parseability), but audio, video and text still rest on the client's declared Content-Type.
+5. **Quotas are per user, with no global disk watermark.** All users together can still fill the disk.
+6. **No self-service SSO linking UI.** The link and unlink endpoints exist, but the end-user interface has no account-settings page to start the flow.
+7. **No subagent-level selection.** Users pick a bundle (persona + model + knowledge bases), not individual subagents; real subagent isolation would require changing AstrBot's core.
 
 ## See also
 

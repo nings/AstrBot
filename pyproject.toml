@@ -121,10 +121,11 @@ exclude = ["dashboard", "node_modules", "dist", "data", "tests"]
 [tool.hatch.metadata]
 allow-direct-references = true
 
-# Include bundled dashboard dists even though they are not tracked by VCS.
-# `dist` is the operator dashboard; `dist-portal` is the end-user chat SPA.
+# Include the bundled dashboard dist even though it is not tracked by VCS.
+# Only the operator dashboard ships in the wheel; the end-user portal SPA is a
+# separate project (AstrBotDevs/astrbot-portal) that operators deploy themselves.
 [tool.hatch.build]
-artifacts = ["astrbot/dashboard/dist/**", "astrbot/dashboard/dist-portal/**"]
+artifacts = ["astrbot/dashboard/dist/**"]
 
 # Custom build hook: builds both Vue SPAs and copies their dists into the package.
 [tool.hatch.build.hooks.custom]

@@ -12,10 +12,11 @@ When enabled, this hook:
 2. Copies the resulting `dashboard/dist/` tree into
    `astrbot/dashboard/dist/` so the static assets are shipped
    inside the Python wheel.
-3. Does the same for the end-user chat SPA: `npm run build:portal`
-   produces `dashboard/dist-portal/`, which is copied into
-   `astrbot/dashboard/dist-portal/` (the path
-   `astrbot.portal.api.static_router.get_bundled_portal_dist_path()` resolves).
+
+Only the operator dashboard is built here. The end-user portal SPA used to be
+a second pass over `npm run build:portal` -> `astrbot/dashboard/dist-portal/`;
+it is now a separate project (AstrBotDevs/astrbot-portal) that operators
+deploy themselves, and AstrBot ships only its API.
 """
 
 import os
@@ -55,13 +56,7 @@ class CustomBuildHook(BuildHookInterface):
                 check=True,
             )
 
-        # Both SPAs are built from the same source tree with separate Vite
-        # configs, so each needs its own build + copy pass. `dist-portal` is the
-        # end-user chat SPA; `dist` is the operator dashboard.
         self._build_and_copy(root, dashboard_src, "build", "dist", "dashboard")
-        self._build_and_copy(
-            root, dashboard_src, "build:portal", "dist-portal", "end-user portal"
-        )
 
     def _build_and_copy(
         self,

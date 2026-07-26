@@ -57,7 +57,6 @@ from astrbot.dashboard.services.update_service import (
 )
 from astrbot.portal import session_rule_guard as portal_session_rule_guard
 from astrbot.portal.api.cors import install_portal_cors
-from astrbot.portal.api.static_router import router as portal_static_router
 from astrbot.portal.config import build_portal_settings, configure_portal_settings
 from astrbot.portal.db import engine as portal_db_engine
 from astrbot.portal.services import core_facade as portal_core_facade
@@ -310,10 +309,5 @@ def create_dashboard_asgi_app(
     app.include_router(legacy_personas_router)
     app.include_router(legacy_updates_router)
     app.include_router(build_api_router())
-    # Must be included BEFORE static_files_router: that router's last route
-    # is a greedy catch-all (GET /{static_path:path}) serving the operator
-    # dashboard's SPA, which would otherwise swallow every /portal/* request
-    # before this router ever got a chance to serve the end-user SPA.
-    app.include_router(portal_static_router)
     app.include_router(static_files_router)
     return app
