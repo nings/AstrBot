@@ -54,7 +54,7 @@ depends on that being true.
 
 from __future__ import annotations
 
-from typing import NoReturn
+from typing import Literal, NoReturn
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -185,6 +185,35 @@ def _is_secure_request(request: Request) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _cookie_security(request: Request) -> tuple[Literal["lax", "none"], bool]:
+    """The ``(samesite, secure)`` pair every portal cookie in this module must
+    be written (and deleted) with.
+
+    Two deployment shapes, two answers -- see
+    ``PortalSettings.cross_origin_cookies`` for the full rationale:
+
+    * **Same-origin** (default, incl. the recommended reverse-proxy setup):
+      ``SameSite=Lax``, ``Secure`` whenever the transport justifies it.
+    * **Cross-origin SPA**: ``SameSite=None``, which browsers only honour
+      together with ``Secure`` -- so ``Secure`` is forced on regardless of
+      what this particular request's transport looks like. ``PortalSettings``
+      already refuses to start in this mode unless every allowed origin is
+      HTTPS, so forcing the flag here cannot produce a cookie that a
+      correctly-configured deployment then drops; what it *does* prevent is a
+      misconfigured proxy (one that forgets ``X-Forwarded-Proto``) silently
+      emitting ``SameSite=None`` without ``Secure``, which every browser
+      rejects outright and which would look like "login does nothing".
+
+    Centralised because these two flags previously appeared as hardcoded
+    literals at eleven separate call sites across this file, including the
+    SSO callback paths -- any one of them missed during a change is a session
+    that silently stops working in exactly one flow.
+    """
+    if get_portal_settings().cross_origin_cookies:
+        return "none", True
+    return "lax", _is_secure_request(request)
+
+
 def _set_auth_cookies(
     request: Request,
     response: Response,
@@ -192,7 +221,7 @@ def _set_auth_cookies(
     csrf_token: str,
 ) -> None:
     settings = get_portal_settings()
-    secure = _is_secure_request(request)
+    samesite, secure = _cookie_security(request)
 
     # Access JWT: httpOnly, readable on every path, short-lived.
     response.set_cookie(
@@ -200,7 +229,7 @@ def _set_auth_cookies(
         token_pair.access_token,
         max_age=settings.access_token_ttl_seconds,
         httponly=True,
-        samesite="lax",
+        samesite=samesite,
         secure=secure,
         path="/",
     )
@@ -212,7 +241,7 @@ def _set_auth_cookies(
         token_pair.refresh_token,
         max_age=settings.refresh_token_ttl_seconds,
         httponly=True,
-        samesite="lax",
+        samesite=samesite,
         secure=secure,
         path=settings.refresh_cookie_path,
     )
@@ -226,7 +255,7 @@ def _set_auth_cookies(
         csrf_token,
         max_age=settings.refresh_token_ttl_seconds,
         httponly=False,
-        samesite="lax",
+        samesite=samesite,
         secure=secure,
         path="/",
     )
@@ -234,28 +263,28 @@ def _set_auth_cookies(
 
 def _clear_auth_cookies(request: Request, response: Response) -> None:
     settings = get_portal_settings()
-    secure = _is_secure_request(request)
+    samesite, secure = _cookie_security(request)
     # delete_cookie must be called with the exact same path the cookie was
     # set with, or browsers will not remove it.
     response.delete_cookie(
         settings.jwt_cookie_name,
         path="/",
         httponly=True,
-        samesite="lax",
+        samesite=samesite,
         secure=secure,
     )
     response.delete_cookie(
         settings.refresh_cookie_name,
         path=settings.refresh_cookie_path,
         httponly=True,
-        samesite="lax",
+        samesite=samesite,
         secure=secure,
     )
     response.delete_cookie(
         settings.csrf_cookie_name,
         path="/",
         httponly=False,
-        samesite="lax",
+        samesite=samesite,
         secure=secure,
     )
 
@@ -307,10 +336,38 @@ AND at read time (`/callback`) by :func:`_validate_redirect_target` -- see
 that function's docstring for why "validated once, trusted forever" is not
 good enough here."""
 
-_SAFE_REDIRECT_PREFIX = "/portal"
-"""The ONLY allowlisted destination space for a post-SSO-login redirect --
-the portal SPA's own serving base (ground truth: "the portal SPA is served
-at /portal"). Anything else is rejected outright, never partially trusted."""
+_DEFAULT_SAFE_REDIRECT_PREFIX = "/portal"
+"""Fallback allowlisted destination space when the SPA's serving base cannot
+be derived from configuration -- the path this SPA used to be served at, back
+when AstrBot hosted it itself. Only reachable if ``sso_redirect_base_url`` is
+unset, which independently disables SSO entirely (see
+``sso_service._require_provider_enabled``), so in practice this is a
+belt-and-braces default rather than a live code path."""
+
+
+def _safe_redirect_prefix() -> str:
+    """The allowlisted destination space for a post-SSO-login redirect: the
+    path component of the SPA's own public base URL.
+
+    Derived rather than hardcoded because the portal SPA is now a separate
+    project with its own deployment, and it is no longer necessarily served
+    at ``/portal``. A deployment that serves it at the origin root yields
+    ``""`` here, which correctly means "any path on the SPA's origin is a
+    legitimate destination" -- the open-redirect guards in
+    :func:`_validate_redirect_target` (no scheme, no netloc, no
+    scheme-relative ``//``) are what actually keep the browser on-origin, and
+    they hold regardless of how long this prefix is.
+
+    Single source of truth with the frontend: the SPA builds the ``next``
+    value it sends here by prefixing its route path with its own Vite
+    ``base`` (see ``src/api/config.ts``'s ``toBasePrefixedPath``). Point
+    ``sso_redirect_base_url`` at the SPA's real public URL and the two agree
+    by construction.
+    """
+    base_url = get_portal_settings().sso_redirect_base_url
+    if not base_url:
+        return _DEFAULT_SAFE_REDIRECT_PREFIX
+    return urlsplit(base_url).path.rstrip("/")
 
 
 def _validate_redirect_target(candidate: str | None) -> str | None:
@@ -325,13 +382,18 @@ def _validate_redirect_target(candidate: str | None) -> str | None:
     unchecked, an attacker can craft a link that authenticates the victim
     legitimately and then bounces their browser to an attacker-controlled
     site, which is often enough for a convincing phishing follow-up. The
-    allowlist here is deliberately a single hardcoded prefix (this SPA's
-    own base), not a regex trying to distinguish "looks like our domain"
-    from "looks like an attacker's domain" -- the only endorsed
-    destinations are pages this SPA itself serves, so anything else is
-    simply out of scope, not a judgment call.
+    allowlist is the SPA's own serving base (see
+    :func:`_safe_redirect_prefix`), not a regex trying to distinguish
+    "looks like our domain" from "looks like an attacker's domain" -- the
+    only endorsed destinations are pages that SPA itself serves, so anything
+    else is simply out of scope, not a judgment call.
     """
     if not isinstance(candidate, str) or not candidate:
+        return None
+    # Must be an absolute path on this origin, always -- this is the check
+    # that actually prevents an open redirect, and it holds even when the
+    # prefix below is empty (SPA served at the origin root).
+    if not candidate.startswith("/"):
         return None
     # A bare prefix check (``startswith("/portal")``) would also accept
     # "/portalx" or "/portal.evil.com" -- still same-origin paths (a
@@ -340,9 +402,8 @@ def _validate_redirect_target(candidate: str | None) -> str | None:
     # escape), but not real pages this SPA serves either. Require an exact
     # match or a genuine path boundary right after the prefix so the
     # allowlist means what it says.
-    if candidate != _SAFE_REDIRECT_PREFIX and not candidate.startswith(
-        _SAFE_REDIRECT_PREFIX + "/"
-    ):
+    prefix = _safe_redirect_prefix()
+    if prefix and candidate != prefix and not candidate.startswith(prefix + "/"):
         return None
     # Reject scheme-relative ("//evil.com/...") and backslash tricks some
     # browsers/proxies still normalize into a scheme-relative URL, plus raw
@@ -732,7 +793,14 @@ async def sso_start(
     ) as exc:
         _raise_for_sso_error(exc)
 
-    secure = _is_secure_request(request)
+    # Same (samesite, secure) policy as the session cookies, and for the same
+    # reason rather than merely for consistency: the SPA's own
+    # `OAuthCallbackPage` reads these back by calling `/sso/{provider}/callback`
+    # over XHR (see that route's docstring -- the IdP's redirect_uri points at
+    # the SPA page, not at this API). In a cross-origin deployment that is a
+    # cross-site XHR, which `SameSite=Lax` would not attach the state cookie
+    # to -- every SSO login would fail as "state expired".
+    samesite, secure = _cookie_security(request)
     callback_path = _sso_callback_cookie_path(provider)
     redirect_response = Response(status_code=302, headers={"Location": result.authorize_url})
     redirect_response.set_cookie(
@@ -740,7 +808,7 @@ async def sso_start(
         result.state,
         max_age=result.state_cookie_max_age_seconds,
         httponly=True,
-        samesite="lax",
+        samesite=samesite,
         secure=secure,
         path=callback_path,
     )
@@ -751,7 +819,7 @@ async def sso_start(
             safe_next,
             max_age=result.state_cookie_max_age_seconds,
             httponly=True,
-            samesite="lax",
+            samesite=samesite,
             secure=secure,
             path=callback_path,
         )
@@ -793,21 +861,24 @@ async def sso_callback(
     # -- always clear both on the way out so a retried/refreshed callback
     # request can never present a stale state/next pairing a second time.
     callback_path = _sso_callback_cookie_path(provider)
-    secure = _is_secure_request(request)
+    # Must match exactly what `sso_start` wrote them with, or the browser
+    # keeps the originals and a stale state/next pairing survives to be
+    # replayed.
+    samesite, secure = _cookie_security(request)
 
     def _clear_sso_cookies() -> None:
         response.delete_cookie(
             sso_service.SSO_STATE_COOKIE_NAME,
             path=callback_path,
             httponly=True,
-            samesite="lax",
+            samesite=samesite,
             secure=secure,
         )
         response.delete_cookie(
             _SSO_NEXT_COOKIE_NAME,
             path=callback_path,
             httponly=True,
-            samesite="lax",
+            samesite=samesite,
             secure=secure,
         )
 
@@ -836,7 +907,12 @@ async def sso_callback(
     if isinstance(result, sso_service.SsoLoginResult):
         csrf_token = generate_csrf_token()
         _set_auth_cookies(request, response, result.token_pair, csrf_token)
-        redirect_to = _validate_redirect_target(next_cookie) or "/portal"
+        # Falls back to the SPA's own root, which is "" when it is served at
+        # the origin root -- normalized to "/" so the SPA always receives a
+        # navigable path rather than an empty string.
+        redirect_to = _validate_redirect_target(next_cookie) or (
+            _safe_redirect_prefix() or "/"
+        )
         return {
             "result": "login",
             "user": _user_payload(result.user),
@@ -881,13 +957,14 @@ async def sso_link_start(
     except (sso_service.SsoServiceError, SsoProviderError) as exc:
         _raise_for_sso_error(exc)
 
+    link_samesite, link_secure = _cookie_security(request)
     response.set_cookie(
         sso_service.SSO_STATE_COOKIE_NAME,
         result.state,
         max_age=result.state_cookie_max_age_seconds,
         httponly=True,
-        samesite="lax",
-        secure=_is_secure_request(request),
+        samesite=link_samesite,
+        secure=link_secure,
         path=_sso_callback_cookie_path(provider),
     )
     return {"authorize_url": result.authorize_url}

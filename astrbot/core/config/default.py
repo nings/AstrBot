@@ -276,6 +276,36 @@ DEFAULT_CONFIG = {
             "ca_certs": "",
         },
     },
+    # 多用户 Portal（终端用户聊天前端）。前端已拆分为独立项目，此处只配置后端 API 行为。
+    # 键名必须与 astrbot/portal/config.py 的 PortalSettings 字段一一对应，未列出的字段
+    # 同样可以手动添加（未知键会在启动时报错，不会被静默忽略）。
+    "portal": {
+        # 跨域部署：前端与本 API 不同源时，在此列出前端的确切 origin
+        # （如 "https://chat.example.com"，不带路径和结尾斜杠）。
+        # 留空表示同源部署（推荐：用 nginx 之类把前端和 /api/ 反代到同一个域名），
+        # 此时完全不会安装 CORS 中间件。不允许填 "*"。
+        "cors_allowed_origins": [],
+        # 跨域部署时必须打开：把会话 cookie 改为 SameSite=None; Secure。
+        # 注意这会让 cookie 变成第三方 cookie —— Safari 默认拦截、Chrome 正在淘汰，
+        # 能用反代同源就不要用这个。要求 cors_allowed_origins 全部为 HTTPS。
+        "cross_origin_cookies": False,
+        # 是否开放自助注册。配置了邀请制或 SSO 的部署应当关掉。
+        "self_registration_open": True,
+        # SSO 总开关；provider 可选 "oidc" / "wecom" / "feishu"。
+        "sso_enabled": False,
+        "sso_enabled_providers": [],
+        # 前端 SPA 的部署地址，用于拼接各 provider 的 redirect_uri，
+        # 必须与 IdP 应用注册里登记的回调地址完全一致（如 "https://chat.example.com"）。
+        "sso_redirect_base_url": "",
+        "oidc_issuer": "",
+        "oidc_client_id": "",
+        "oidc_client_secret": "",
+        "wecom_corp_id": "",
+        "wecom_agent_id": "",
+        "wecom_app_secret": "",
+        "feishu_app_id": "",
+        "feishu_app_secret": "",
+    },
     "platform": [],
     "platform_specific": {
         # 平台特异配置：按平台分类，平台下按功能分组

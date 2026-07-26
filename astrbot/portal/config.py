@@ -31,8 +31,10 @@ from __future__ import annotations
 
 import asyncio
 import secrets
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, fields, replace
+from typing import Any
+from urllib.parse import urlsplit
 
 # ---------------------------------------------------------------------------
 # JWT secret storage location (SharedPreferences scope/scope_id/key triple).
@@ -91,6 +93,63 @@ treating it as disabled) and as the canonical key set every
 provider-availability/adapter-dispatch table in this module should iterate."""
 
 
+# ---------------------------------------------------------------------------
+# CORS origin validation helpers (used by PortalSettings.__post_init__).
+# ---------------------------------------------------------------------------
+
+_LOCALHOST_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _validate_cors_origin(origin: str) -> None:
+    """Reject anything that is not a bare ``scheme://host[:port]`` origin.
+
+    Starlette's ``CORSMiddleware`` compares the request's ``Origin`` header
+    against these entries by exact string equality, so a value carrying a
+    path or a trailing slash never matches anything and silently behaves as
+    "this origin was never allowed" -- exactly the kind of quiet
+    misconfiguration this module fails closed on elsewhere.
+    """
+    if not isinstance(origin, str) or not origin.strip():
+        raise ValueError(
+            "PortalSettings.cors_allowed_origins entries must be non-empty "
+            f"strings; got {origin!r}"
+        )
+
+    if origin == "*":
+        raise ValueError(
+            "PortalSettings.cors_allowed_origins may not contain '*': the "
+            "portal API is only ever called with credentials, and the CORS "
+            "spec forbids Access-Control-Allow-Origin: * together with "
+            "Access-Control-Allow-Credentials: true (browsers reject the "
+            "response). List the SPA's exact origin instead."
+        )
+
+    parts = urlsplit(origin)
+    if parts.scheme not in ("http", "https"):
+        raise ValueError(
+            "PortalSettings.cors_allowed_origins entries must start with "
+            f"http:// or https://; got {origin!r}"
+        )
+    if not parts.hostname:
+        raise ValueError(
+            f"PortalSettings.cors_allowed_origins entry {origin!r} has no host"
+        )
+    if parts.path or parts.query or parts.fragment:
+        raise ValueError(
+            "PortalSettings.cors_allowed_origins entries must be bare origins "
+            f"(scheme://host[:port]) with no path or trailing slash; got {origin!r}"
+        )
+
+
+def _is_secure_origin(origin: str) -> bool:
+    """Whether a browser treats ``origin`` as a secure context -- true HTTPS,
+    or loopback (which browsers exempt so local development still works)."""
+    parts = urlsplit(origin)
+    if parts.scheme == "https":
+        return True
+    return (parts.hostname or "").lower() in _LOCALHOST_HOSTNAMES
+
+
 @dataclass(frozen=True)
 class PortalSettings:
     """Immutable, process-wide settings for the portal module.
@@ -113,6 +172,61 @@ class PortalSettings:
     csrf_header_name: str = PORTAL_CSRF_HEADER_NAME
     refresh_cookie_path: str = "/api/v1/portal/auth/refresh"
     """Path scope for the refresh cookie: only sent to the refresh endpoint."""
+
+    # --- Cross-origin deployment --------------------------------------------
+    #
+    # The portal SPA used to be served by this very process at ``/portal``, so
+    # every request was same-origin by construction and the cookie contract
+    # above could hardcode ``SameSite=Lax`` with no CORS layer at all. The SPA
+    # now lives in its own repository and its own deployment, which admits two
+    # shapes:
+    #
+    # * **Reverse-proxied onto one origin** (recommended): the operator's own
+    #   web server serves the SPA and proxies ``/api/`` through to AstrBot, so
+    #   the browser still sees a single origin. Cookies stay first-party,
+    #   ``SameSite=Lax`` keeps working, and no CORS headers are needed --
+    #   i.e. both settings below stay at their defaults and nothing changes.
+    # * **Separate origins** (e.g. SPA on ``https://chat.example.com``, API on
+    #   ``https://bot.example.com``): requires both settings below. Be aware
+    #   this makes the portal's session cookies *third-party* cookies, which
+    #   Safari blocks by default and Chrome is phasing out -- see
+    #   ``cross_origin_cookies`` for the full caveat.
+    cors_allowed_origins: tuple[str, ...] = ()
+    """Exact origins allowed to make credentialed cross-origin calls into
+    ``/api/v1/portal/*``. Empty (the default) means **no CORS layer is
+    installed at all** -- not "allow nothing", but "this deployment is
+    same-origin and the middleware is never added", which is the correct
+    shape for the reverse-proxy deployment above.
+
+    Entries must be bare origins (``scheme://host[:port]``, no path, no
+    trailing slash) and ``"*"`` is rejected outright: this API is only ever
+    called with credentials, and the CORS spec forbids pairing a wildcard
+    origin with ``Access-Control-Allow-Credentials: true`` -- browsers reject
+    the response, so a wildcard here cannot work even if it were safe (it is
+    not: it would let any site on the internet drive a logged-in user's
+    portal session). Validated in :meth:`__post_init__`."""
+
+    cross_origin_cookies: bool = False
+    """Whether to issue the three portal cookies with ``SameSite=None;
+    Secure`` instead of ``SameSite=Lax``.
+
+    Required when the SPA is on a different origin than this API: a
+    ``SameSite=Lax`` cookie is simply not attached to cross-site XHR, so
+    login would appear to succeed and every subsequent request would 401.
+
+    **This is a degraded mode, not an equivalent one.** ``SameSite=None``
+    cookies are third-party cookies from the browser's point of view: Safari
+    blocks them by default (ITP) and Chrome has been phasing them out, so a
+    cross-origin portal deployment will be broken for a real fraction of
+    users through no fault of the deployment. Prefer the reverse-proxy shape
+    documented above; reach for this only when a single origin genuinely is
+    not achievable, and expect to move to a token-based scheme if
+    cross-origin becomes the primary deployment.
+
+    ``SameSite=None`` is only honoured together with ``Secure``, so enabling
+    this requires every configured origin to be HTTPS (localhost is exempt --
+    browsers treat it as a secure context, which keeps local development
+    workable). Validated in :meth:`__post_init__`."""
 
     # --- Registration ---------------------------------------------------
     self_registration_open: bool = True
@@ -605,10 +719,10 @@ class PortalSettings:
     shortcut."""
 
     def __post_init__(self) -> None:
-        """Fail closed on an unknown ``sso_enabled_providers`` entry at
-        settings-construction time (startup), rather than letting a typo
-        silently behave as "that provider is disabled" with no signal to
-        the operator that anything is wrong."""
+        """Fail closed on a misconfigured deployment at settings-construction
+        time (startup), rather than letting a typo silently behave as a
+        narrower security surface with no signal to the operator that
+        anything is wrong."""
         unknown = self.sso_enabled_providers - ALL_SSO_PROVIDERS
         if unknown:
             raise ValueError(
@@ -617,18 +731,230 @@ class PortalSettings:
                 f"{sorted(ALL_SSO_PROVIDERS)!r}"
             )
 
+        for origin in self.cors_allowed_origins:
+            _validate_cors_origin(origin)
+
+        # `SameSite=None` without CORS is a contradiction: the only reason to
+        # relax the cookies is a cross-origin SPA, and that SPA cannot call
+        # this API at all without being on the allowlist. Catching it here
+        # turns a confusing "login succeeds, everything else 401s" runtime
+        # symptom into a startup error naming the actual mistake.
+        if self.cross_origin_cookies and not self.cors_allowed_origins:
+            raise ValueError(
+                "PortalSettings.cross_origin_cookies is enabled but "
+                "cors_allowed_origins is empty; a cross-origin SPA must be "
+                "on the CORS allowlist to reach this API at all. Either list "
+                "the SPA's origin, or leave cross_origin_cookies off for a "
+                "same-origin (reverse-proxied) deployment."
+            )
+
+        # SameSite=None is only honoured alongside Secure, and Secure cookies
+        # are only set over a secure context. An http:// origin here would
+        # produce cookies the browser silently drops.
+        if self.cross_origin_cookies:
+            insecure = [
+                origin
+                for origin in self.cors_allowed_origins
+                if not _is_secure_origin(origin)
+            ]
+            if insecure:
+                raise ValueError(
+                    "PortalSettings.cross_origin_cookies requires every entry "
+                    f"in cors_allowed_origins to be HTTPS; got {insecure!r}. "
+                    "SameSite=None cookies are only honoured with the Secure "
+                    "flag, which browsers only accept over a secure context "
+                    "(localhost is exempt and may stay http:// for local "
+                    "development)."
+                )
+
 
 DEFAULT_PORTAL_SETTINGS = PortalSettings()
 
 
-def get_portal_settings() -> PortalSettings:
-    """Return the module's settings.
+# ---------------------------------------------------------------------------
+# Operator overrides.
+#
+# Phase 1 shipped `get_portal_settings()` returning a module-level constant
+# with no override path at all -- which meant several fields documented as
+# operator-facing ("a deployment should set this to False",
+# "an operator ... must be able to turn the entire surface off with one flag")
+# were unreachable dead configuration, `sso_redirect_base_url` included, and
+# with it the whole SSO surface.
+#
+# `build_portal_settings` closes that as a **pure function over a plain
+# mapping**: it never reads a file, an env var or `AstrBotConfig`. That is
+# deliberate and load-bearing for this module's capability wall (see the
+# module docstring) -- sourcing the mapping is the caller's job
+# (`astrbot/dashboard/api/app.py` reads it out of `AstrBotConfig` at startup
+# and calls `configure_portal_settings`), which keeps this file trivially
+# unit-testable with plain dicts and free of any core import.
+# ---------------------------------------------------------------------------
 
-    Phase 1 ships no on-disk override mechanism; this indirection exists so
-    a later phase can source overrides (env vars, an admin-configurable
-    table) without changing every call site.
+NON_OVERRIDABLE_FIELDS = frozenset(
+    {
+        "jwt_cookie_name",
+        "refresh_cookie_name",
+        "csrf_cookie_name",
+        "csrf_header_name",
+        "refresh_cookie_path",
+    }
+)
+"""Fields an operator may never override.
+
+These five are a wire protocol shared with the SPA, not a preference: the
+frontend reads `astrbot_portal_csrf` by name and echoes it back in the
+`X-Portal-CSRF-Token` header, and the refresh cookie's `Path` is what scopes
+it to the refresh endpoint. Renaming any of them from config would break
+every client while looking like a valid setting, and the collision-avoidance
+guarantee against the core dashboard's `astrbot_dashboard_jwt` (rule 6) would
+become an operator's problem instead of an invariant.
+"""
+
+
+def _overridable_defaults() -> dict[str, Any]:
+    return {
+        f.name: getattr(DEFAULT_PORTAL_SETTINGS, f.name)
+        for f in fields(PortalSettings)
+        if f.name not in NON_OVERRIDABLE_FIELDS
+    }
+
+
+def _coerce(name: str, raw: Any, default: Any) -> Any:
+    """Coerce one raw config value to the type of that field's default.
+
+    Dispatching on the *default value's* runtime type rather than the field
+    annotation is deliberate: this module uses
+    ``from __future__ import annotations``, so every annotation is a plain
+    string here and would have to be re-parsed. Every field in
+    ``PortalSettings`` has a concrete default that pins its type, and the
+    ``None`` defaults are all ``str | None``.
     """
-    return DEFAULT_PORTAL_SETTINGS
+    # bool before int: bool is an int subclass, and JSON `true` must not
+    # silently become the integer 1 for an int-typed field (or vice versa).
+    if isinstance(default, bool):
+        if not isinstance(raw, bool):
+            raise ValueError(
+                f"portal setting {name!r} must be a boolean; got {raw!r}"
+            )
+        return raw
+
+    if isinstance(default, int):
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise ValueError(
+                f"portal setting {name!r} must be an integer; got {raw!r}"
+            )
+        return raw
+
+    if isinstance(default, float):
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise ValueError(f"portal setting {name!r} must be a number; got {raw!r}")
+        return float(raw)
+
+    if isinstance(default, str):
+        if not isinstance(raw, str):
+            raise ValueError(f"portal setting {name!r} must be a string; got {raw!r}")
+        return raw
+
+    if isinstance(default, (tuple, frozenset)):
+        if isinstance(raw, str) or not isinstance(raw, (list, tuple, set, frozenset)):
+            raise ValueError(
+                f"portal setting {name!r} must be a list of strings; got {raw!r}"
+            )
+        items = [item.strip() for item in raw if isinstance(item, str) and item.strip()]
+        if len(items) != len(list(raw)):
+            raise ValueError(
+                f"portal setting {name!r} must contain only non-empty strings; "
+                f"got {raw!r}"
+            )
+        return tuple(items) if isinstance(default, tuple) else frozenset(items)
+
+    if default is None:
+        # Every None-defaulted field on PortalSettings is `str | None`. An
+        # empty string means "not configured" rather than "configured to the
+        # empty string" -- the config template ships these as "" placeholders,
+        # and a blank OIDC issuer must read as absent, not as a value that
+        # passes `bool(...)` availability checks by accident.
+        if raw is None:
+            return None
+        if not isinstance(raw, str):
+            raise ValueError(
+                f"portal setting {name!r} must be a string or null; got {raw!r}"
+            )
+        stripped = raw.strip()
+        return stripped or None
+
+    raise ValueError(f"portal setting {name!r} has an unsupported type")
+
+
+def build_portal_settings(raw: Mapping[str, Any] | None) -> PortalSettings:
+    """Build a :class:`PortalSettings` from an operator-supplied mapping.
+
+    Keys absent from ``raw`` keep their default. An unknown key raises rather
+    than being ignored: a typo'd setting name is a misconfiguration the
+    operator wants to hear about at startup, not one that silently leaves the
+    intended value at its default (same fail-closed reasoning as
+    ``sso_enabled_providers`` validation in ``__post_init__``).
+
+    All cross-field validation still happens in ``__post_init__`` -- this
+    function only parses and type-checks.
+    """
+    if not raw:
+        return DEFAULT_PORTAL_SETTINGS
+
+    defaults = _overridable_defaults()
+
+    unknown = sorted(set(raw) - set(defaults))
+    if unknown:
+        blocked = sorted(set(unknown) & NON_OVERRIDABLE_FIELDS)
+        if blocked:
+            raise ValueError(
+                f"portal settings {blocked!r} may not be overridden from "
+                "configuration: they are part of the wire protocol shared "
+                "with the portal frontend."
+            )
+        raise ValueError(
+            f"unknown portal setting(s) {unknown!r}; valid keys are "
+            f"{sorted(defaults)!r}"
+        )
+
+    overrides = {
+        name: _coerce(name, value, defaults[name]) for name, value in raw.items()
+    }
+    return replace(DEFAULT_PORTAL_SETTINGS, **overrides)
+
+
+_active_settings: PortalSettings = DEFAULT_PORTAL_SETTINGS
+
+
+def configure_portal_settings(settings: PortalSettings) -> None:
+    """Install the process-wide settings every ``get_portal_settings()``
+    caller will see from now on.
+
+    Called once at startup, before the app serves any request. Not
+    thread-safe by design and not meant to be called mid-flight: the value is
+    read on nearly every request path, and swapping it under live traffic
+    would let a single request observe two different policies.
+    """
+    global _active_settings
+    _active_settings = settings
+
+
+def reset_portal_settings() -> None:
+    """Restore the built-in defaults. For tests, so one test's override
+    cannot leak into the next."""
+    global _active_settings
+    _active_settings = DEFAULT_PORTAL_SETTINGS
+
+
+def get_portal_settings() -> PortalSettings:
+    """Return the process-wide portal settings.
+
+    Defaults to :data:`DEFAULT_PORTAL_SETTINGS` until
+    :func:`configure_portal_settings` installs operator overrides at startup,
+    so importing this module in isolation (a test, a script) still yields a
+    complete, valid configuration.
+    """
+    return _active_settings
 
 
 # ---------------------------------------------------------------------------

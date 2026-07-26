@@ -56,7 +56,9 @@ from astrbot.dashboard.services.update_service import (
     call_pip_install,
 )
 from astrbot.portal import session_rule_guard as portal_session_rule_guard
+from astrbot.portal.api.cors import install_portal_cors
 from astrbot.portal.api.static_router import router as portal_static_router
+from astrbot.portal.config import build_portal_settings, configure_portal_settings
 from astrbot.portal.db import engine as portal_db_engine
 from astrbot.portal.services import core_facade as portal_core_facade
 from astrbot.portal.startup_checks import (
@@ -177,6 +179,28 @@ def create_dashboard_asgi_app(
     app.state.db = db
     app.state.jwt_secret = jwt_secret
     app.state.dashboard_static_folder = static_folder
+
+    # Portal settings must be installed here, synchronously at app-construction
+    # time, rather than in the lifespan hook below: `install_portal_cors` reads
+    # them to decide whether to add middleware at all, and middleware cannot be
+    # added once the app has started. A bad value raises out of
+    # `build_portal_settings`/`PortalSettings.__post_init__` and aborts startup
+    # by design -- this module fails closed on misconfiguration rather than
+    # silently narrowing its own security surface.
+    portal_settings = build_portal_settings(core_lifecycle.astrbot_config.get("portal"))
+    configure_portal_settings(portal_settings)
+    if install_portal_cors(app, portal_settings):
+        LogManager.GetLogger("astrbot.portal").info(
+            "Portal CORS enabled for %s; session cookies are %s.",
+            ", ".join(portal_settings.cors_allowed_origins),
+            "SameSite=None; Secure (third-party cookies -- blocked by Safari "
+            "and being phased out by Chrome; prefer serving the portal SPA "
+            "behind a reverse proxy on this same origin)"
+            if portal_settings.cross_origin_cookies
+            else "still SameSite=Lax, which a browser will NOT send on "
+            "cross-site requests -- set portal.cross_origin_cookies if the "
+            "SPA really is on another origin",
+        )
     log_broker = getattr(core_lifecycle, "log_broker", None) or LogBroker()
     app.state.services = SimpleNamespace(
         config_profiles=ConfigProfileService(core_lifecycle, db),
