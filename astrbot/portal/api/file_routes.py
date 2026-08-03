@@ -179,13 +179,23 @@ async def upload_attachment(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/{attachment_id}")
+@router.api_route("/{attachment_id}", methods=["GET", "HEAD"])
 async def download_attachment(
     attachment_id: str,
     request: Request,
     current_user: PortalUser = Depends(get_current_user),
 ) -> FileResponse:
     """Serve an attachment the caller owns.
+
+    ``HEAD`` has to be registered explicitly. FastAPI's ``@router.get``
+    registers ``methods=["GET"]`` and nothing else, so a ``HEAD`` request
+    against a GET-only route gets a flat ``405`` -- it does *not* fall back
+    to running the handler and dropping the body. The portal's file chip
+    probes with ``HEAD`` before offering a download
+    (``PortalAttachment.vue::probeFileExists``) and renders
+    "unavailable or deleted" on any non-OK response, so a GET-only
+    registration marks *every* file attachment broken in the UI. Starlette
+    still discards the body for us, so ``HEAD`` costs a stat, not a read.
 
     Ownership is checked by ``attachment_service.download`` against
     ``PortalAttachmentOwner`` BEFORE anything else happens; a missing row

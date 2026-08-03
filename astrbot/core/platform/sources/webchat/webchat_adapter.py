@@ -20,6 +20,7 @@ from astrbot.core.platform.astr_message_event import MessageSesion
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from ...register import register_platform_adapter
+from .attachment_staging import stage_webchat_attachments
 from .message_parts_helper import (
     message_chain_to_storage_message_parts,
     parse_webchat_message_parts,
@@ -217,6 +218,14 @@ class WebChatAdapter(Platform):
         # 处理消息段列表
         message_parts = payload.get("message", [])
         abm.message, message_str_parts = await self._parse_message_parts(message_parts)
+
+        # Uploads land in the shared `data/attachments`, which the agent's file
+        # tools refuse to read for non-admin users. Copy them into this
+        # session's workspace before anything downstream records their paths.
+        await stage_webchat_attachments(
+            abm.message,
+            umo=f"{self.metadata.id}:{abm.type.value}:{abm.session_id}",
+        )
 
         logger.debug(f"WebChatAdapter: {abm.message}")
 

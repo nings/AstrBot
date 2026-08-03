@@ -335,6 +335,52 @@ async def test_owner_can_download_their_own_upload(
 
 
 @pytest.mark.asyncio
+async def test_owner_can_probe_their_own_upload_with_head(
+    client: httpx.AsyncClient, two_users: tuple[str, str]
+):
+    """The file chip probes with HEAD before offering a download.
+
+    Regression test: the route used to be registered with ``@router.get``,
+    and FastAPI answers a GET-only route's HEAD with a flat 405 rather than
+    running the handler body-less. ``PortalAttachment.vue`` treats any
+    non-OK probe as "unavailable or deleted", so that 405 marked *every*
+    file attachment broken in the UI even though the bytes were fine.
+    """
+    user_a, _user_b = two_users
+    cookies_a, headers_a = _auth(user_a)
+
+    upload_resp = await _upload(client, cookies_a, headers_a, content=b"A's own bytes")
+    assert upload_resp.status_code == 201, upload_resp.text
+    attachment_id = upload_resp.json()["attachment_id"]
+
+    head_resp = await client.head(
+        f"/api/v1/portal/files/{attachment_id}", cookies=cookies_a
+    )
+    assert head_resp.status_code == 200, head_resp.text
+    assert head_resp.content == b""
+
+
+@pytest.mark.asyncio
+async def test_head_probe_of_another_users_upload_is_404(
+    client: httpx.AsyncClient, two_users: tuple[str, str]
+):
+    """HEAD must not become the existence oracle the GET path refuses to be."""
+    user_a, user_b = two_users
+    cookies_a, headers_a = _auth(user_a)
+
+    upload_resp = await _upload(client, cookies_a, headers_a, content=b"A's secret file")
+    assert upload_resp.status_code == 201, upload_resp.text
+    attachment_id = upload_resp.json()["attachment_id"]
+
+    cookies_b, _headers_b = _auth(user_b)
+    response = await client.head(
+        f"/api/v1/portal/files/{attachment_id}", cookies=cookies_b
+    )
+    assert response.status_code == 404, response.text
+    assert response.status_code != 403
+
+
+@pytest.mark.asyncio
 async def test_other_user_download_is_404_not_403(
     client: httpx.AsyncClient, two_users: tuple[str, str]
 ):
