@@ -24,3 +24,6 @@ tests/
 .ruff_cache/
 .astrbot
 astrbot.lock
+
+# Standalone gateway service (built from gateway/Dockerfile)
+gateway/

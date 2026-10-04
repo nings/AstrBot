@@ -1,0 +1,23 @@
+# AstrBot stays on the internal network; only the gateway is published.
+services:
+  astrbot:
+    image: soulter/astrbot:latest
+    restart: always
+    volumes:
+      - ./astrbot_data:/AstrBot/data
+    # WebUI for admins only. Bind to localhost and reach it via SSH tunnel/VPN.
+    ports:
+      - "127.0.0.1:6185:6185"
+
+  gateway:
+    build: .
+    restart: always
+    env_file: .env
+    environment:
+      ASTRBOT_BASE_URL: http://astrbot:6185
+    volumes:
+      - ./gateway_data:/data
+    ports:
+      - "8080:8080"
+    depends_on:
+      - astrbot
