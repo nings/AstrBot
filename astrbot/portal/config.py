@@ -351,27 +351,51 @@ class PortalSettings:
             "text/plain",
             "text/csv",
             "application/json",
+            # Word / HTML / Markdown / RTF. The attachment route serves every
+            # non-image/audio/video type as a forced download (see
+            # file_routes.py), so text/html never renders inline from this
+            # origin.
+            "application/msword",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/rtf",
+            "text/markdown",
+            "text/html",
+            # Spreadsheets / WPS / OpenDocument (legal office docs). Legacy
+            # macro-capable binary formats (.xls, .et/.wps/.dps) are included
+            # deliberately -- the attachment route never renders them inline.
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-excel",
+            "application/vnd.oasis.opendocument.spreadsheet",
+            "application/vnd.oasis.opendocument.text",
+            "application/kset",
+            "application/kswps",
+            "application/ksdps",
         }
     )
     """MIME-type allowlist for uploads, enforced against the client-declared
     `content_type` before core ever writes bytes to disk (and, for images,
     re-checked against core's post-sniff detected MIME).
 
-    Deliberately excludes anything that renders/executes as active content
-    if served back to a browser or that commonly disguises unwanted
-    payloads: no `image/svg+xml` (SVG can carry embedded `<script>`, an XSS
-    vector when this attachment is later served or previewed), no
-    `text/html`/`application/javascript`, no archive formats
-    (`application/zip` and friends -- zip-bomb/decompression and
-    "malware disguised as a document" risk, and archives are not a useful
-    input to a multimodal chat model anyway), and no Office macro-enabled
-    formats. Legacy/macro-enabled MS Office (`.doc`/`.xls`/`.ppt`,
-    `application/vnd.ms-*`) and their modern OOXML equivalents
-    (`application/vnd.openxmlformats-officedocument.*`) are also left off
-    this default list -- if a deployment needs them, add the specific MIME
-    types deliberately rather than opening the whole Office family
-    (`.doc`/`.xls` can carry macros; the newer OOXML types are safer but
-    still parsed by third-party libraries with their own attack surface).
+    Still deliberately excludes anything that executes as active content
+    when served inline or that commonly disguises unwanted payloads: no
+    `image/svg+xml` (SVG can carry embedded `<script>`, an XSS vector when
+    this attachment is later served or previewed), no
+    `application/javascript`, and no archive formats (`application/zip`
+    and friends -- zip-bomb/decompression and "malware disguised as a
+    document" risk). Plain Word documents (`.doc`/`.docx`), `text/html`,
+    Markdown and RTF ARE allowed: the attachment route serves every
+    non-image/audio/video type as a forced `Content-Disposition:
+    attachment` download with `X-Content-Type-Options: nosniff` and
+    `Content-Security-Policy: default-src 'none'; sandbox`, so an uploaded
+    HTML file is downloaded rather than rendered inline from this origin
+    (no in-origin XSS path). Spreadsheets and WPS formats (`.xlsx`/`.xls`,
+    `.et`, `.wps`, `.dps`, `.ods`/`.odt`) are also allowed for legal use;
+    note `.xls`/`.et`/`.wps`/`.dps` are legacy/macro-capable binary formats,
+    so residual risk is confined to whichever library parses them upstream
+    (they are never rendered inline, only downloaded). Macro-enabled archive
+    formats (`.xlsm`, `.pptm`) and general archives (`application/zip` and
+    friends) remain excluded -- if a deployment needs them, add the specific
+    MIME types deliberately rather than opening a whole family.
     This is a static allowlist for Phase 2; there is no admin-configurable
     override yet (matches this dataclass's existing "no on-disk override
     mechanism" limitation noted on `get_portal_settings`).

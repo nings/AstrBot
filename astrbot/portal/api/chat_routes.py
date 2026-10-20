@@ -415,12 +415,24 @@ async def list_chat_sessions(
     request: Request,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
+    search: str = Query(default="", max_length=200),
     current_user: PortalUser = Depends(get_current_user),
 ) -> dict[str, Any]:
     try:
         sessions = await core_facade.list_sessions(current_user.user_id, request)
     except CoreFacadeError as exc:
         _raise_for_core_error(exc)
+
+    # Case-insensitive title search (server-side) so search works across the
+    # whole history, not just the currently loaded page.
+    query = search.strip().lower()
+    if query:
+        sessions = [
+            s
+            for s in sessions
+            if query in (s.get("display_name") or "").lower()
+            or query in s.get("session_id", "").lower()
+        ]
 
     total = len(sessions)
     start = (page - 1) * page_size
